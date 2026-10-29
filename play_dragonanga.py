@@ -792,7 +792,7 @@ class InfoPump:
 class DragonangaWindow(Gtk.Window):
     def __init__(self, engine_path):
         super().__init__(title="Dragonanga Engine Tester (Fairy-Stockfish)")
-        self.set_default_size(700, 860)
+        self.set_default_size(660, 720)
         self.connect("destroy", self.on_destroy)
 
         self.engine = UCIEngine(engine_path)   # searches
@@ -892,7 +892,7 @@ class DragonangaWindow(Gtk.Window):
 
         # Board drawing area
         self.area = Gtk.DrawingArea()
-        self.area.set_size_request(640, 640)
+        self.area.set_size_request(240, 240)
         self.area.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK
             | Gdk.EventMask.BUTTON_RELEASE_MASK
