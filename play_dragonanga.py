@@ -1,5 +1,8 @@
 """Dragonanga engine tester (Fairy-Stockfish).
 
+Engine: the app looks for dragonanga-engine (or stockfish) next to itself, otherwise it asks
+for the file. You can also pass the path as an argument or set DRAGONANGA_ENGINE.
+
 Modes (the three buttons never reset the game, so you can swap sides mid-game)
   * Play as White / Play as Black   the engine plays the other side (board turns to match)
   * Analysis Mode                   you move both sides, the engine never plays by itself
@@ -33,6 +36,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import threading
 import cairo
 import gi
@@ -612,6 +616,7 @@ class UCIEngine:
             stderr=subprocess.STDOUT,
             universal_newlines=True,
             bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),  # Windows: no black console flashing up
         )
         self.lock = threading.Lock()        # one conversation with the engine at a time
         self._wlock = threading.Lock()      # keeps single commands from interleaving
@@ -1444,9 +1449,35 @@ class DragonangaWindow(Gtk.Window):
         )
 
 
+ENGINE_NAMES = ("dragonanga-engine", "stockfish", "fairy-stockfish")
+
+
+def app_dirs():
+    """Folders searched for the engine that ships with the app (packaged .exe or plain script)."""
+    dirs = []
+    if getattr(sys, "frozen", False):                 # PyInstaller build
+        dirs.append(getattr(sys, "_MEIPASS", None))   # where bundled files are unpacked
+        dirs.append(os.path.dirname(sys.executable))  # next to play_dragonanga.exe
+    dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    return [d for d in dirs if d]
+
+
+def find_bundled_engine(dirs=None):
+    """Path of an engine shipped with the app, or None.  Looks for dragonanga-engine / stockfish
+    (+ .exe on Windows) in the app folder and in an 'engine' sub-folder."""
+    suffix = ".exe" if os.name == "nt" else ""
+    for folder in (dirs if dirs is not None else app_dirs()):
+        for sub in ("", "engine"):
+            for name in ENGINE_NAMES:
+                path = os.path.join(folder, sub, name + suffix)
+                if os.path.isfile(path) and (os.name == "nt" or os.access(path, os.X_OK)):
+                    return path
+    return None
+
+
 def pick_engine_executable():
     dialog = Gtk.FileChooserDialog(
-        title="Select your compiled Fairy-Stockfish .exe",
+        title="Select the Dragonanga engine (your compiled Fairy-Stockfish)",
         action=Gtk.FileChooserAction.OPEN,
     )
     dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
@@ -1456,9 +1487,25 @@ def pick_engine_executable():
     return path
 
 
+def show_error(text):
+    dialog = Gtk.MessageDialog(
+        message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE, text=text)
+    dialog.run()
+    dialog.destroy()
+
+
 if __name__ == "__main__":
-    exe = pick_engine_executable()
+    # Engine: a path given on the command line or in DRAGONANGA_ENGINE, else the one shipped with
+    # the app, else ask.
+    exe = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("DRAGONANGA_ENGINE")) \
+        or find_bundled_engine() or pick_engine_executable()
     if exe and os.path.isfile(exe):
-        win = DragonangaWindow(exe)
-        win.show_all()
-        Gtk.main()
+        try:
+            win = DragonangaWindow(exe)
+        except OSError as e:
+            show_error(f"The engine could not be started:\n{exe}\n\n{e}")
+        else:
+            win.show_all()
+            Gtk.main()
+    elif exe:
+        show_error(f"Engine not found:\n{exe}")
