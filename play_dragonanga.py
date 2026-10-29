@@ -445,6 +445,7 @@ def draw_circle(cr, sq, name, flipped, rgb, alpha=0.8):
     cx, cy = _centre(name, flipped, sq)
     cr.set_source_rgba(rgb[0], rgb[1], rgb[2], alpha)
     cr.set_line_width(sq * 0.06)
+    cr.new_sub_path()
     cr.arc(cx, cy, sq * 0.45, 0, 6.283185307)
     cr.stroke()
 
@@ -496,6 +497,7 @@ def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, 
                     cr.set_source_rgb(0.98, 0.98, 0.96)
                 else:
                     cr.set_source_rgb(0.16, 0.16, 0.18)
+                cr.new_sub_path()
                 cr.arc(cx, cy, sq * 0.39, 0, 6.283)
                 cr.fill_preserve()
 
