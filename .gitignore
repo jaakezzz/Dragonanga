@@ -1,0 +1,18 @@
+# Build output: everything packaging/build_*.sh produces goes in release/
+release/
+
+# Leftovers from earlier PyInstaller runs (safe to delete)
+build/
+dist/
+state/
+*.spec
+Dragonanga-windows-x64/
+Dragonanga-linux-x86_64/
+
+# Release archives (publish these as GitHub Releases instead of committing them)
+*.zip
+*.tar.gz
+
+# Python
+__pycache__/
+*.pyc
