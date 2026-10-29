@@ -12,6 +12,12 @@ Position
                       or raw engine letters; the app converts it for the engine.
   * The FEN in the status line is shown in designer letters too.
 
+Engine strength
+  * Strength 1-8     how well the engine plays when it moves (1 weakest, 8 full strength).
+                     Analysis ("Show best move" / "Show lines") always runs at full strength.
+                     At 8 the engine thinks for the Think Time below; levels 1-7 use short
+                     fixed times, like the levels on Lichess.
+
 Analysis
   * Show best move   blue arrow for the engine's best move on your turn
   * Show lines       the engine's 3 best continuations, written in designer notation
@@ -66,11 +72,34 @@ NOTATION_CHOICES = (
 MODES = {
     "white": ({"w"}, "Playing White"),
     "black": ({"b"}, "Playing Black"),
-    "analysis": ({"w", "b"}, "Analysis (you move both sides)"),
+    "analysis": ({"w", "b"}, "Analysis"),
 }
 
 NUM_LINES = 3      # "Show lines" shows this many continuations
 MAX_PLIES = 10     # plies shown per line
+
+# Strength levels 1-8, the same scheme the Lichess / Pychess AI levels use: Fairy-Stockfish's
+# "Skill Level" option (it deliberately picks weaker moves) plus a depth cap and a time limit per
+# move.   level -> (Skill Level, depth cap or None, milliseconds per move or None = Think Time)
+STRENGTH_LEVELS = {
+    1: (-9, 5, 50),
+    2: (-5, 5, 100),
+    3: (-1, 5, 150),
+    4: (3, 5, 200),
+    5: (7, 5, 300),
+    6: (11, 8, 400),
+    7: (16, 13, 500),
+    8: (20, None, None),   # full strength: Skill Level 20 (off), no depth cap, Think Time
+}
+DEFAULT_STRENGTH = 8
+FULL_SKILL = 20            # Fairy-Stockfish's "Skill Level" when no handicap is wanted
+
+
+def strength_settings(level, think_ms):
+    """Strength level 1-8 and the Think Time (ms) -> (skill_level, depth_cap_or_None, movetime_ms)."""
+    level = max(1, min(8, int(level)))
+    skill, depth, movetime = STRENGTH_LEVELS[level]
+    return skill, depth, (think_ms if movetime is None else min(movetime, think_ms))
 
 
 def display_piece(letter):
@@ -174,12 +203,9 @@ def parse_info_line(line, stm):
     }
 
 
-def format_eval(info, show_line=True):
+def format_eval(info):
     depth = info["depth"] if info["depth"] is not None else "?"
-    text = f"Eval (White's view): {info['score']} | Depth: {depth}"
-    if show_line and info.get("text"):
-        text += f" | Line: {info['text']}"
-    return text
+    return f"{info['score']} | Depth: {depth}"
 
 
 def format_line_row(info):
@@ -243,7 +269,7 @@ def game_over_text(fen, in_check, prev_fen=None):
     if mover_bare and not stm_not_bare and quiet:
         return "Game Over — Draw! Both sides are down to a lone Queen Fairy."
     if mover_bare and stm_not_bare and quiet:
-        return (f"Game Over — Baremate! ... {name[mover]}'s lone Queen Fairy made a quiet move. "
+        return (f"Game Over — Baremate! {name[mover]}'s lone Queen Fairy made a quiet move. "
                 f"{name[stm]} wins.")
     if in_check:
         return f"Game Over — Checkmate! {name[mover]} wins."
@@ -663,19 +689,26 @@ class UCIEngine:
                 print(f"[ENGINE STATE] FEN: {fen} | Legal Moves: {len(legal_moves)} | Checkers: '{checkers}'")
             return fen, legal_moves, bool(checkers)
 
-    def search(self, moves, movetime_ms, info_callback, cancel=None, multipv=1, start_fen=None):
+    def search(self, moves, movetime_ms, info_callback, cancel=None, multipv=1, start_fen=None,
+               skill=FULL_SKILL, depth=None):
         """Run an engine search and return bestmove.
 
         movetime_ms=None means 'go infinite' (background analysis); it only ends
         when request_stop(cancel) is called.  If `cancel` is already set by the
         time this search gets its turn, nothing is run.
+        skill / depth handicap the search (see STRENGTH_LEVELS); every search sets the skill
+        explicitly, so analysis always runs at full strength.
         """
         with self.lock:
             if cancel is not None and cancel.is_set():
                 return None
             self.send(f"setoption name MultiPV value {multipv}")
+            self.send(f"setoption name Skill Level value {skill}")
             self.send(position_cmd(start_fen, moves))
-            self.send("go infinite" if movetime_ms is None else f"go movetime {movetime_ms}")
+            go = "go infinite" if movetime_ms is None else f"go movetime {movetime_ms}"
+            if depth and movetime_ms is not None:
+                go += f" depth {depth}"
+            self.send(go)
             with self._stop_lock:
                 self._active_cancel = cancel
                 if cancel is not None and cancel.is_set():
@@ -861,11 +894,18 @@ class DragonangaWindow(Gtk.Window):
             ("Play as White", lambda _: self.set_mode("white")),
             ("Play as Black", lambda _: self.set_mode("black")),
             ("Analysis Mode", lambda _: self.set_mode("analysis")),
-            ("Undo Turn", self.on_undo),
         ):
             btn = Gtk.Button(label=label)
             btn.connect("clicked", handler)
             row1.pack_start(btn, False, False, 0)
+
+        # Strength sits at the right edge of row 1, exactly above Think Time on row 2.
+        self.strength_spin = Gtk.SpinButton.new_with_range(1, 8, 1)
+        self.strength_spin.set_value(DEFAULT_STRENGTH)
+        self.strength_spin.set_tooltip_text(
+            "How strong the engine is when it plays a move: 1 = weakest, 8 = full strength.\n"
+            "Analysis (best move arrow, lines) always uses full strength.")
+        self.pack_spin_right(row1, "Strength (1-8):", self.strength_spin)
 
         # Row 2: position and view
         row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -887,23 +927,39 @@ class DragonangaWindow(Gtk.Window):
         self.lines_chk.connect("toggled", self.on_analysis_option_toggled)
         row2.pack_start(self.lines_chk, False, False, 0)
 
-        row2.pack_start(Gtk.Label(label="Think Time (sec):"), False, False, 4)
         self.time_spin = Gtk.SpinButton.new_with_range(0.5, 30.0, 0.5)
         self.time_spin.set_value(2.0)
-        row2.pack_start(self.time_spin, False, False, 0)
-
-        hint = Gtk.Label(label="Right-click drag = arrow (Shift red, Ctrl orange, Alt purple) | left click clears")
-        hint.set_xalign(0)
-        vbox.pack_start(hint, False, False, 0)
+        self.time_spin.set_tooltip_text("Thinking time per engine move at Strength 8 (levels 1-7 use short fixed times).")
+        self.pack_spin_right(row2, "Think Time (sec):", self.time_spin)
 
         # Status & Eval labels
         self.status_label = Gtk.Label(label="Ready")
         self.status_label.set_xalign(0)
         vbox.pack_start(self.status_label, False, False, 2)
 
-        self.eval_label = Gtk.Label(label="Eval (White's view): -- | Depth: -- | Line: --")
+        eval_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        vbox.pack_start(eval_row, False, False, 2)
+
+        # "Eval [x]: +0.35 | Depth: 12" -- the checkbox shows / hides the evaluation text
+        eval_title = Gtk.Label(label="Eval")
+        eval_title.set_tooltip_text("From White's point of view: + = White ahead, - = Black ahead")
+        eval_row.pack_start(eval_title, False, False, 0)
+
+        self.eval_chk = Gtk.CheckButton()
+        self.eval_chk.set_active(True)
+        self.eval_chk.set_tooltip_text("Show or hide the evaluation")
+        self.eval_chk.connect("toggled", lambda _: self.refresh_eval())
+        eval_row.pack_start(self.eval_chk, False, False, 0)
+
+        self.eval_text = "-- | Depth: --"
+        self.eval_label = Gtk.Label(label=": " + self.eval_text)
         self.eval_label.set_xalign(0)
-        vbox.pack_start(self.eval_label, False, False, 2)
+        eval_row.pack_start(self.eval_label, True, True, 0)
+
+        btn_undo = Gtk.Button(label="Undo Turn")
+        btn_undo.connect("clicked", self.on_undo)
+        self.make_compact(btn_undo)
+        eval_row.pack_end(btn_undo, False, False, 0)
 
         # Engine lines panel (only visible while "Show lines" is ticked)
         self.lines_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -933,6 +989,37 @@ class DragonangaWindow(Gtk.Window):
 
         self.set_mode("white")
         self.new_game()
+
+    def set_eval(self, text):
+        """Remember the latest evaluation text; it is only shown while the Eval box is ticked."""
+        self.eval_text = text
+        self.refresh_eval()
+
+    def refresh_eval(self):
+        self.eval_label.set_text(": " + self.eval_text if self.eval_chk.get_active() else "")
+
+    @staticmethod
+    def pack_spin_right(row, text, spin):
+        """Put "label [spin]" at the right edge of a row. Both rows use the same label and spin
+        widths, so the two spin boxes line up exactly above each other."""
+        spin.set_width_chars(5)
+        row.pack_end(spin, False, False, 0)   # pack_end: the first widget packed is the right-most
+        label = Gtk.Label(label=text)
+        label.set_width_chars(17)
+        label.set_xalign(1)
+        row.pack_end(label, False, False, 4)
+
+    @staticmethod
+    def make_compact(button):
+        """Shrink a button's padding so it fits on a line of text."""
+        try:
+            css = Gtk.CssProvider()
+            css.load_from_data(b"button.compact { padding: 0px 8px; min-height: 0px; min-width: 0px; }")
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            button.get_style_context().add_class("compact")
+        except Exception:
+            pass  # purely cosmetic: keep the normal button if styling is unavailable
 
     def on_destroy(self, *_):
         try:
@@ -976,7 +1063,7 @@ class DragonangaWindow(Gtk.Window):
         self.last_move = None
         self.notes.clear()
         self.engine.new_game()
-        self.eval_label.set_text("Eval (White's view): +0.00 | Starting position")
+        self.set_eval("+0.00 | Starting position")
         self.sync_board()
         self.maybe_engine_move()
 
@@ -1072,7 +1159,7 @@ class DragonangaWindow(Gtk.Window):
         self.last_move = None
         self.notes.clear()
         self.engine.new_game()
-        self.eval_label.set_text(f"Eval (White's view): -- | Position imported ({used} letters)")
+        self.set_eval(f"-- | Position imported ({used} letters)")
         self.sync_board()
         self.maybe_engine_move()
         return used
@@ -1146,14 +1233,16 @@ class DragonangaWindow(Gtk.Window):
         cancel = threading.Event()
         self.engine_cancel = cancel
         self.status_label.set_text("Fairy-Stockfish is thinking...")
-        movetime_ms = int(self.time_spin.get_value() * 1000)
+        skill, depth, movetime_ms = strength_settings(
+            self.strength_spin.get_value(), int(self.time_spin.get_value() * 1000))
         moves, start_fen = list(self.moves), self.start_fen
         pump = self.make_pump(cancel, lambda res: GLib.idle_add(self.on_engine_info, gen, res), 1)
 
         def worker():
             best = None
             try:
-                best = self.engine.search(moves, movetime_ms, pump.feed, cancel=cancel, start_fen=start_fen)
+                best = self.engine.search(moves, movetime_ms, pump.feed, cancel=cancel, start_fen=start_fen,
+                                          skill=skill, depth=depth)
             finally:
                 pump.close()
             GLib.idle_add(self.finish_engine_move, gen, best)
@@ -1171,7 +1260,7 @@ class DragonangaWindow(Gtk.Window):
 
     def on_engine_info(self, gen, results):
         if gen == self.engine_gen and self.thinking and results:
-            self.eval_label.set_text(format_eval(results[0]))
+            self.set_eval(format_eval(results[0]))
         return False
 
     def finish_engine_move(self, gen, bestmove):
@@ -1227,7 +1316,7 @@ class DragonangaWindow(Gtk.Window):
         self.analysis_lines = results
         top = results[0]
         self.best_move = top["pv"][0] if top["pv"] else None
-        self.eval_label.set_text(format_eval(top, show_line=not self.lines_chk.get_active()))
+        self.set_eval(format_eval(top))
         self.refresh_lines_panel()
         self.area.queue_draw()
         return False
