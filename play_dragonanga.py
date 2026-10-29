@@ -223,6 +223,33 @@ def _compress_rank(squares):
     return "".join(out)
 
 
+def game_over_text(fen, in_check, prev_fen=None):
+    """Message for a position in which the side to move has no legal moves (engine FEN letters)."""
+    parts = fen.split()
+    stm = parts[1] if len(parts) > 1 else "w"
+    name = {"w": "White", "b": "Black"}
+    mover = "b" if stm == "w" else "w"
+
+    def pieces(side):
+        return [ch.upper() for ch in parts[0] if ch.isalpha() and ch.isupper() == (side == "w")]
+
+    def was_capture(before, after):
+        count = lambda f: sum(ch.isalpha() for ch in f.split()[0])
+        return count(before) > count(after)
+
+    mover_bare = pieces(mover) == ["K"]             # engine letter K = Queen Fairy
+    stm_not_bare = any(ch != "K" for ch in pieces(stm))
+    quiet = bool(prev_fen) and not was_capture(prev_fen, fen)
+    if mover_bare and not stm_not_bare and quiet:
+        return "Game Over — Draw! Both sides are down to a lone Queen Fairy."
+    if mover_bare and stm_not_bare and quiet:
+        return (f"Game Over — Baremate! ... {name[mover]}'s lone Queen Fairy made a quiet move. "
+                f"{name[stm]} wins.")
+    if in_check:
+        return f"Game Over — Checkmate! {name[mover]} wins."
+    return f"Game Over — Stalemate! {name[stm]} has no moves and wins."
+
+
 def parse_import_fen(text, notation=AUTO):
     """Turn a pasted FEN into an engine FEN.  Returns (engine_fen, notation_used).
 
@@ -1004,10 +1031,10 @@ class DragonangaWindow(Gtk.Window):
         turn = "White" if self.turn_color() == "w" else "Black"
         mode = MODES[self.mode][1]
         if not self.legal_moves:
-            if self.in_check:
-                self.status_label.set_text(f"Game Over — Checkmate! ({turn} has no moves)")
-            else:
-                self.status_label.set_text(f"Game Over — Baremate / Stalemate! ({turn} has no moves)")
+            prev_fen = None
+            if self.moves:  # position before the last move, to tell a baremate from a stalemate
+                prev_fen = self.engine.get_state(self.moves[:-1], self.start_fen, quiet=True)[0]
+            self.status_label.set_text(game_over_text(self.fen, self.in_check, prev_fen))
         else:
             chk = " (IN CHECK!)" if self.in_check else ""
             self.status_label.set_text(
