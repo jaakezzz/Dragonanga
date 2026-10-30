@@ -27,6 +27,13 @@ Analysis
                      (piece letter + square, x = capture, =F promotion, + check, # mate)
   * Eval is always from White's point of view: + = White ahead, - = Black ahead
 
+Move list
+  * Move List        tick it to show the game next to the board in designer notation. Click a move
+                     to jump to that position. Playing a different move from an earlier position
+                     starts a variation (shown in brackets); nothing is ever deleted.
+  * Undo Move / Redo Move   step back / forward (against the engine: your move and its reply)
+  * Import PGN / Export PGN   below the list; variations are kept
+
 Pieces
   * Pieces: drop-down   Simple tokens (built in) or any picture set found in the pieces/ folder,
                         e.g. pieces/Handmade/white-soldier.png ... black-minister.png
@@ -36,6 +43,9 @@ Drawing
   * Right click + drag   arrow (Shift red, Ctrl orange, Alt purple); right click a square = circle
   * Left click           select / move, and clears the drawings
 """
+import bisect
+import collections
+import datetime
 import html
 import math
 import os
@@ -84,6 +94,8 @@ MODES = {
     "analysis": ({"w", "b"}, "Analysis"),
 }
 
+SIDE_WIDTH = 250   # width of the move list panel in pixels
+MAX_INDENT = 8     # deepest variation level that is indented further
 NUM_LINES = 3      # "Show lines" shows this many continuations
 MAX_PLIES = 10     # plies shown per line
 
@@ -168,7 +180,7 @@ def position_cmd(start_fen, moves):
 
 
 def undo_length(start_stm, n_moves, human_sides):
-    """How many plies to keep after 'Undo Turn', or None if there is nothing to undo.
+    """How many plies to keep after 'Undo Move', or None if there is nothing to undo.
 
     Takes back plies until it is a human side's turn again (so against the engine
     that is your move and its reply; in Analysis Mode it is a single ply)."""
@@ -258,31 +270,61 @@ def _compress_rank(squares):
     return "".join(out)
 
 
-def game_over_text(fen, in_check, prev_fen=None):
-    """Message for a position in which the side to move has no legal moves (engine FEN letters)."""
+def game_outcome(fen, in_check, prev_fen=None):
+    """How a position in which the side to move has no legal moves ended (engine FEN letters).
+
+    Returns (kind, winner): kind is 'draw', 'baremate', 'checkmate' or 'stalemate'; winner is 'w',
+    'b' or None for a draw.
+
+    Dragonanga rules: checkmate loses; stalemate WINS for the stalemated side; baremate means a lone
+    Queen Fairy that makes a quiet (non-capturing) move loses at once while the opponent still has other
+    pieces (and it is a draw if the opponent is a lone Queen Fairy too). The engine ends the game right
+    after that move, so the side to move 'has no moves' then.
+    prev_fen is the position before the last move (None at a loaded position, where no move has been
+    played yet)."""
     parts = fen.split()
     stm = parts[1] if len(parts) > 1 else "w"
-    name = {"w": "White", "b": "Black"}
     mover = "b" if stm == "w" else "w"
 
     def pieces(side):
         return [ch.upper() for ch in parts[0] if ch.isalpha() and ch.isupper() == (side == "w")]
 
     def was_capture(before, after):
+        """Did the last move capture? One fewer piece on the board than before."""
         count = lambda f: sum(ch.isalpha() for ch in f.split()[0])
         return count(before) > count(after)
 
-    mover_bare = pieces(mover) == ["K"]             # engine letter K = Queen Fairy
+    mover_bare = pieces(mover) == ["K"]             # engine letter K = Queen Fairy (royal)
     stm_not_bare = any(ch != "K" for ch in pieces(stm))
     quiet = bool(prev_fen) and not was_capture(prev_fen, fen)
     if mover_bare and not stm_not_bare and quiet:
-        return "Game Over — Draw! Both sides are down to a lone Queen Fairy."
+        return "draw", None
     if mover_bare and stm_not_bare and quiet:
-        return (f"Game Over — Baremate! {name[mover]}'s lone Queen Fairy made a quiet move. "
-                f"{name[stm]} wins.")
+        return "baremate", stm
     if in_check:
-        return f"Game Over — Checkmate! {name[mover]} wins."
+        return "checkmate", mover
+    return "stalemate", stm
+
+
+def game_over_text(fen, in_check, prev_fen=None):
+    """Message for a position in which the side to move has no legal moves (engine FEN letters)."""
+    kind, winner = game_outcome(fen, in_check, prev_fen)
+    name = {"w": "White", "b": "Black"}
+    stm = fen.split()[1] if len(fen.split()) > 1 else "w"
+    mover = other_side(stm)
+    if kind == "draw":
+        return "Game Over — Draw! Both sides are down to a lone Queen Fairy."
+    if kind == "baremate":
+        return (f"Game Over — Baremate! {name[mover]}'s lone Queen Fairy made a quiet move. "
+                f"{name[winner]} wins.")
+    if kind == "checkmate":
+        return f"Game Over — Checkmate! {name[winner]} wins."
     return f"Game Over — Stalemate! {name[stm]} has no moves and wins."
+
+
+def pgn_result(fen, in_check, prev_fen=None):
+    """PGN result string for a finished position: '1-0', '0-1' or '1/2-1/2'."""
+    return {"w": "1-0", "b": "0-1", None: "1/2-1/2"}[game_outcome(fen, in_check, prev_fen)[1]]
 
 
 def parse_import_fen(text, notation=AUTO):
@@ -419,6 +461,304 @@ def number_line(sans, stm, fullmove):
             num += 1
         side = other_side(side)
     return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Game tree: the move list with variations
+#
+# Every move is a Node that points straight at its parent and its children (no id lookups needed).
+# children[0] is the main continuation, the other children are variations.  The current position is
+# just a pointer to one node; the moves from the start are found by walking up the parents.  Undo,
+# redo and jumping only move that pointer, so nothing is ever deleted (a move you take back stays
+# in the list as a variation as soon as you play something else).
+# ---------------------------------------------------------------------------
+class Node:
+    __slots__ = ("id", "move", "san", "fen", "parent", "children", "ply", "redo")
+
+    def __init__(self, node_id, move, san, fen, parent):
+        self.id = node_id          # unique number, used by the move list to find the node again
+        self.move = move           # UCI move that led here (None for the start position)
+        self.san = san             # the same move in designer notation, e.g. 'Gc3+'
+        self.fen = fen             # engine FEN after the move (None if not known)
+        self.parent = parent
+        self.children = []
+        self.ply = parent.ply + 1 if parent else 0
+        self.redo = None           # the child Redo should follow (the one visited last)
+
+    def child_for(self, move):
+        for child in self.children:
+            if child.move == move:
+                return child
+        return None
+
+
+class GameTree:
+    def __init__(self, start_fen=None):
+        self.start_fen = start_fen                         # None = the normal start position
+        parts = start_fen.split() if start_fen else []
+        self.start_stm = parts[1] if len(parts) > 1 else "w"
+        try:
+            self.start_fullmove = max(1, int(parts[5]))
+        except (IndexError, ValueError):
+            self.start_fullmove = 1
+        self.root = Node(0, None, None, start_fen, None)
+        self.nodes = {0: self.root}
+        self._next_id = 1
+
+    def add(self, parent, move, san=None, fen=None):
+        """The child of `parent` that plays `move`; it is created unless it already exists."""
+        child = parent.child_for(move)
+        if child is None:
+            child = Node(self._next_id, move, san or move, fen, parent)
+            self._next_id += 1
+            parent.children.append(child)
+            self.nodes[child.id] = child
+        return child
+
+    def moves(self, node):
+        """UCI moves from the start position to `node`."""
+        out = []
+        while node.parent is not None:
+            out.append(node.move)
+            node = node.parent
+        out.reverse()
+        return out
+
+    def visit(self, node):
+        """Remember the way to `node` so that Redo walks back down the same line."""
+        while node.parent is not None:
+            node.parent.redo = node
+            node = node.parent
+
+    def redo_child(self, node):
+        if node.redo is not None and node.redo in node.children:
+            return node.redo
+        return node.children[0] if node.children else None
+
+    def main_end(self):
+        node = self.root
+        while node.children:
+            node = node.children[0]
+        return node
+
+    def ancestor(self, node, ply):
+        while node.ply > ply:
+            node = node.parent
+        return node
+
+    def stm_after(self, node):
+        """Side to move in the position after `node`."""
+        return self.start_stm if node.ply % 2 == 0 else other_side(self.start_stm)
+
+    def mover(self, node):
+        """Side that played the move `node`."""
+        return other_side(self.stm_after(node))
+
+    def fullmove(self, node):
+        """Full-move number of the move `node` (1 for the first move of a normal game)."""
+        return self.start_fullmove + (node.ply - 1 + (0 if self.start_stm == "w" else 1)) // 2
+
+
+# ----- the move list text -----------------------------------------------------
+Seg = collections.namedtuple("Seg", "text node style level")   # style: num, move, paren or plain
+
+
+def layout_move_list(tree):
+    """The move list as a list of Seg pieces (text, the node it stands for, style, indent level).
+
+    Main line in two columns, variations indented below the move they replace:
+        1.  Ga3     Ga6
+            (1. Gb3 Gb6 2. Ga4
+              (2. Gc3))
+        2.  Gb4     Gb6"""
+    segs = []
+
+    def add(text, node=None, style="plain", level=0):
+        if text:
+            segs.append(Seg(text, node, style, level))
+
+    def at_line_start():
+        return not segs or segs[-1].text.endswith("\n")
+
+    def newline(level=0):
+        if not at_line_start():
+            add("\n", None, "plain", level)
+
+    def number(num, dots):
+        text = f"{num}{dots}"
+        return text + " " * max(1, 4 - len(text))
+
+    def variation(first, level):
+        newline(level)
+        add("(", None, "paren", level)
+        node, need_num = first, True
+
+        def tok(text, tok_node=None, style="plain"):
+            if segs and segs[-1].text[-1] not in "(\n":
+                add(" ", None, "plain", level)
+            add(text, tok_node, style, level)
+
+        while node:
+            num = tree.fullmove(node)
+            if tree.mover(node) == "w":
+                tok(f"{num}.", None, "num")
+            elif need_num:
+                tok(f"{num}...", None, "num")
+            tok(node.san, node, "move")
+            need_num = False
+            parent = node.parent
+            alts = parent.children[1:] if node is parent.children[0] else []
+            for alt in alts:
+                variation(alt, level + 1)
+            if alts and node.children:
+                newline(level)
+                need_num = True
+            node = node.children[0] if node.children else None
+        add(")", None, "paren", level)
+
+    node, row_white = tree.root, None      # row_white: the White move a row currently ends with
+    while node.children:
+        child = node.children[0]
+        num = tree.fullmove(child)
+        if tree.mover(child) == "w":
+            newline()
+            add(number(num, "."), None, "num")
+            add(child.san, child, "move")
+            row_white = child.san
+        elif row_white is not None:
+            add(" " * max(2, 8 - len(row_white)), None, "plain")
+            add(child.san, child, "move")
+            row_white = None
+        else:
+            newline()
+            add(number(num, "..."), None, "num")
+            add(child.san, child, "move")
+        alts = node.children[1:]
+        for alt in alts:
+            variation(alt, 1)
+        if alts:
+            newline()
+            row_white = None
+        node = child
+    return segs
+
+
+# ----- PGN ----------------------------------------------------------------------------
+PGN_RESULTS = ("1-0", "0-1", "1/2-1/2", "*")
+
+
+def pgn_movetext(tree):
+    """Move text of a PGN: '1. Ga3 Ga6 (1... Gb6 2. Ga4) 2. Gb4', variations in parentheses."""
+    def line(first):
+        tokens, node, force = [], first, True
+        while node:
+            num = tree.fullmove(node)
+            if tree.mover(node) == "w":
+                tokens.append(f"{num}.")
+            elif force:
+                tokens.append(f"{num}...")
+            tokens.append(node.san)
+            force = False
+            parent = node.parent
+            alts = parent.children[1:] if node is parent.children[0] else []
+            for alt in alts:
+                sub = line(alt)
+                sub[0] = "(" + sub[0]
+                sub[-1] += ")"
+                tokens.extend(sub)
+            if alts:
+                force = True
+            node = node.children[0] if node.children else None
+        return tokens
+    return line(tree.root.children[0]) if tree.root.children else []
+
+
+def tree_to_pgn(tree, result="*", date=None):
+    """The whole game as PGN text.  Piece letters are the designer letters (S G E H D Q K F M)."""
+    tags = [
+        ("Event", "Dragonanga Engine Tester game"), ("Site", "?"),
+        ("Date", date or datetime.date.today().strftime("%Y.%m.%d")), ("Round", "-"),
+        ("White", "?"), ("Black", "?"), ("Result", result), ("Variant", "Dragonanga"),
+    ]
+    if tree.start_fen:
+        tags += [("SetUp", "1"), ("FEN", engine_fen_to_designer(tree.start_fen))]
+    out = ['[%s "%s"]' % (k, re.sub(r'(["\\])', r"\\\1", v)) for k, v in tags]   # escape " and \
+    out.append("")
+    row = ""
+    for token in pgn_movetext(tree) + [result]:     # wrap at 80 columns
+        if row and len(row) + 1 + len(token) > 80:
+            out.append(row)
+            row = token
+        else:
+            row = f"{row} {token}" if row else token
+    out.append(row)
+    return "\n".join(out) + "\n"
+
+
+PGN_TAG = re.compile(r'^\s*\[(\w+)\s+"((?:[^"\\]|\\.)*)"\s*\]\s*$')
+PGN_TOKEN = re.compile(r"\(|\)|\{[^}]*\}|;[^\n]*|\$\d+|\d+\.+|1-0|0-1|1/2-1/2|\*|[^\s(){};$]+")
+
+
+def split_pgn(text):
+    """First game of a PGN text -> (tag dict, movetext)."""
+    tags, body, in_body = {}, [], False
+    for raw in text.replace("\ufeff", "").splitlines():
+        line = raw.strip()
+        if line.startswith("%"):
+            continue
+        match = PGN_TAG.match(raw)
+        if match and not in_body:
+            tags[match.group(1)] = re.sub(r'\\(["\\])', r"\1", match.group(2))   # undo \" and \\
+        elif match and in_body and body:
+            break                                    # the tags of the next game
+        elif line:
+            in_body = True
+            body.append(raw)
+    return tags, "\n".join(body)
+
+
+def pgn_to_tree(text, converter):
+    """Read the first game of a PGN text into a GameTree.  Raises ValueError with a readable message
+    if the text has no moves, a bad FEN tag, an illegal move or unbalanced parentheses."""
+    tags, body = split_pgn(text)
+    start_fen = None
+    if tags.get("FEN") and tags.get("SetUp", "1") != "0":
+        try:
+            start_fen, _ = parse_import_fen(tags["FEN"])
+        except ValueError as e:
+            raise ValueError(f"The FEN tag in the PGN is not usable: {e}")
+    tree = GameTree(start_fen)
+    cur, stack, played = tree.root, [], 0
+    for match in PGN_TOKEN.finditer(body):
+        tok = match.group(0)
+        if tok == "(":
+            if cur.parent is None:
+                raise ValueError("A variation '(' appears before the first move.")
+            stack.append(cur)
+            cur = cur.parent
+        elif tok == ")":
+            if not stack:
+                raise ValueError("Unbalanced ')' in the move text.")
+            cur = stack.pop()
+        elif tok in PGN_RESULTS:
+            if not stack:
+                break
+        elif tok[0] in "{;$" or re.match(r"^\d+\.+$", tok):
+            continue                                  # comment, NAG or move number
+        else:
+            before = tree.moves(cur)
+            try:
+                uci = converter.parse_san(start_fen, before, tok)
+            except ValueError:
+                raise ValueError(f"The move {tok!r} (ply {len(before) + 1}) is not legal in that position.")
+            san, fen = converter.san_move(start_fen, before, uci)
+            cur = tree.add(cur, uci, san, fen)
+            played += 1
+    if stack:
+        raise ValueError("A variation '(' is never closed.")
+    if not played:
+        raise ValueError("No moves found in the PGN.")
+    return tree
 
 
 class Annotations:
@@ -778,6 +1118,29 @@ class NotationConverter:
             self.cache[key] = hit
         return hit
 
+    def san_move(self, start_fen, moves, uci):
+        """Designer notation of `uci` played after `moves`, with + / # marks -> (san, fen after)."""
+        fen, legal, _ = self.state(start_fen, moves)
+        nfen, nlegal, nchk = self.state(start_fen, list(moves) + [uci])
+        san = designer_move(fen_to_board(fen), legal, uci, check=nchk, mate=nchk and not nlegal)
+        return san, nfen
+
+    def parse_san(self, start_fen, moves, token):
+        """UCI move for a designer-notation token ('Gc3', 'Exd4+', ...) in the position after `moves`.
+        Check marks and !? are ignored; plain engine moves ('c2c3') are accepted too."""
+        fen, legal, _ = self.state(start_fen, moves)
+        board = fen_to_board(fen)
+        clean = re.sub(r"[+#!?]+$", "", token)
+        table = {designer_move(board, legal, m): m for m in legal}
+        if clean in table:
+            return table[clean]
+        loose = [m for san, m in table.items() if san.lower() == clean.lower()]
+        if len(loose) == 1:
+            return loose[0]
+        if clean in legal:
+            return clean
+        raise ValueError(f"{token!r} is not a legal move here")
+
     def convert(self, start_fen, base_moves, pv, should_stop=lambda: False):
         """UCI moves `pv`, played from the position after `base_moves`, -> list of designer
         notation strings.  Returns None if should_stop() became true; raises on illegal moves."""
@@ -876,7 +1239,10 @@ class DragonangaWindow(Gtk.Window):
 
         self.start_fen = None                  # None = normal start position, else an imported engine FEN
         self.start_stm = "w"
-        self.moves = []
+        self.tree = GameTree(None)             # every move played, with its variations
+        self.current = self.tree.root          # the position on the board
+        self.move_spans = []                   # (start offset, end offset, node id) in the move list text
+        self.side_delta = 0                    # how much the window grew when the move list was shown
         self.fen = ""
         self.legal_moves = []
         self.in_check = False
@@ -974,10 +1340,21 @@ class DragonangaWindow(Gtk.Window):
         self.eval_label.set_xalign(0)
         eval_row.pack_start(self.eval_label, True, True, 0)
 
-        btn_undo = Gtk.Button(label="Undo Turn")
-        btn_undo.connect("clicked", self.on_undo)
-        self.make_compact(btn_undo)
-        eval_row.pack_end(btn_undo, False, False, 0)
+        # Right end of the line, right to left: Move List, Redo Move, Undo Move, then the piece style
+        self.move_chk = Gtk.CheckButton(label="Move List")
+        self.move_chk.set_tooltip_text("Show the moves next to the board")
+        self.move_chk.connect("toggled", self.on_move_list_toggled)
+        eval_row.pack_end(self.move_chk, False, False, 0)
+
+        self.btn_redo = Gtk.Button(label="Redo Move")
+        self.btn_redo.connect("clicked", self.on_redo)
+        self.make_compact(self.btn_redo)
+        eval_row.pack_end(self.btn_redo, False, False, 0)
+
+        self.btn_undo = Gtk.Button(label="Undo Move")
+        self.btn_undo.connect("clicked", self.on_undo)
+        self.make_compact(self.btn_undo)
+        eval_row.pack_end(self.btn_undo, False, False, 0)
 
         # Piece style: only shown when there are picture sets to choose from
         if self.piece_sets:
@@ -1016,10 +1393,118 @@ class DragonangaWindow(Gtk.Window):
         self.area.connect("button-press-event", self.on_press)
         self.area.connect("button-release-event", self.on_release)
         self.area.connect("motion-notify-event", self.on_motion)
-        vbox.pack_start(self.area, True, True, 0)
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        vbox.pack_start(body, True, True, 0)
+        body.pack_start(self.area, True, True, 0)
+        self.build_move_panel(body)
 
         self.set_mode("white")
         self.new_game()
+
+    # ----- move list panel -------------------------------------------------------
+    def build_move_panel(self, body):
+        """The scrollable move list with Import / Export PGN below it (hidden until 'Move List' is ticked)."""
+        self.side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.side.set_size_request(SIDE_WIDTH, -1)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_shadow_type(Gtk.ShadowType.IN)
+        self.move_view = Gtk.TextView()
+        self.move_view.set_editable(False)
+        self.move_view.set_cursor_visible(False)
+        self.move_view.set_monospace(True)
+        self.move_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.move_view.set_left_margin(6)
+        self.move_view.set_right_margin(6)
+        self.move_view.set_top_margin(4)
+        self.move_view.set_bottom_margin(4)
+        self.move_view.connect("button-release-event", self.on_move_list_click)
+        scroll.add(self.move_view)
+        self.side.pack_start(scroll, True, True, 0)
+
+        buf = self.move_view.get_buffer()
+        buf.create_tag("num", foreground="#7a7a7a")        # move numbers
+        buf.create_tag("paren", foreground="#7a7a7a")      # the brackets around variations
+        for level in range(1, MAX_INDENT + 1):             # one indent per variation level
+            buf.create_tag(f"indent{level}", left_margin=6 + 14 * level)
+        buf.create_tag("current", background="#ffe082", foreground="#000000")   # the move on the board
+        buf.create_mark("curmove", buf.get_start_iter(), True)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_in = Gtk.Button(label="Import PGN")
+        btn_in.connect("clicked", self.on_import_pgn)
+        buttons.pack_start(btn_in, True, True, 0)
+        btn_out = Gtk.Button(label="Export PGN")
+        btn_out.connect("clicked", self.on_export_pgn)
+        buttons.pack_start(btn_out, True, True, 0)
+        self.side.pack_start(buttons, False, False, 0)
+
+        # show_all() skips a no-show-all widget, so its children are shown one by one
+        for widget in (scroll, self.move_view, buttons, btn_in, btn_out):
+            widget.show()
+        self.side.set_no_show_all(True)
+        body.pack_start(self.side, False, False, 0)
+
+    def on_move_list_toggled(self, chk):
+        width, height = self.get_size()
+        if chk.get_active():
+            # grow the window by the panel width, minus the blank space beside the board
+            alloc = self.area.get_allocation()
+            gap = max(0, alloc.width - min(alloc.width, alloc.height))
+            self.side_delta = max(0, SIDE_WIDTH + 8 - gap)
+            self.side.show()
+            self.resize(width + self.side_delta, height)
+            self.refresh_move_list()
+        else:
+            self.side.hide()
+            self.resize(max(1, width - self.side_delta), height)
+            self.side_delta = 0
+
+    def refresh_move_list(self):
+        """Rebuild the move list text from the game tree and highlight the current move."""
+        if not self.move_chk.get_active():
+            return
+        buf = self.move_view.get_buffer()
+        buf.set_text("")
+        self.move_spans = []
+        pos, current_span = 0, None
+        for seg in layout_move_list(self.tree):
+            names = [seg.style] if seg.style in ("num", "paren") else []
+            if seg.level:
+                names.append(f"indent{min(seg.level, MAX_INDENT)}")
+            buf.insert_with_tags_by_name(buf.get_end_iter(), seg.text, *names)
+            end = pos + len(seg.text)
+            if seg.node is not None:
+                self.move_spans.append((pos, end, seg.node.id))
+                if seg.node is self.current:
+                    current_span = (pos, end)
+            pos = end
+        if current_span:
+            start = buf.get_iter_at_offset(current_span[0])
+            buf.apply_tag_by_name("current", start, buf.get_iter_at_offset(current_span[1]))
+            buf.move_mark_by_name("curmove", start)
+            self.move_view.scroll_to_mark(buf.get_mark("curmove"), 0.1, False, 0.0, 0.0)
+        else:
+            self.move_view.scroll_to_mark(buf.get_mark("curmove"), 0.0, True, 0.0, 0.0)
+
+    def node_at_offset(self, offset):
+        """The game tree node whose move is written at this character offset of the list, or None."""
+        i = bisect.bisect_right([span[0] for span in self.move_spans], offset) - 1
+        if i >= 0 and self.move_spans[i][0] <= offset < self.move_spans[i][1]:
+            return self.tree.nodes.get(self.move_spans[i][2])
+        return None
+
+    def on_move_list_click(self, view, event):
+        if event.button != 1 or view.get_buffer().get_has_selection():
+            return False                        # not a plain left click (e.g. the end of a text selection)
+        x, y = view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(event.x), int(event.y))
+        found = view.get_iter_at_location(x, y)     # newer GTK returns (over_text, iter)
+        over_text, it = found if isinstance(found, tuple) else (True, found)
+        node = self.node_at_offset(it.get_offset()) if over_text else None
+        if node is not None:
+            self.go_to(node)
+        return False
 
     def load_piece_set(self, name):
         """Select the named picture set (TOKENS = the built-in drawn pieces)."""
@@ -1105,7 +1590,8 @@ class DragonangaWindow(Gtk.Window):
         self.cancel_engine_move()
         self.cancel_analysis()
         self.start_fen, self.start_stm = None, "w"
-        self.moves = []
+        self.tree = GameTree(None)
+        self.current = self.tree.root
         self.selected_sq = None
         self.last_move = None
         self.notes.clear()
@@ -1117,20 +1603,77 @@ class DragonangaWindow(Gtk.Window):
     def on_undo(self, _):
         was_thinking = self.thinking
         self.cancel_engine_move()
-        keep = undo_length(self.start_stm, len(self.moves), self.human_sides)
+        keep = undo_length(self.start_stm, self.current.ply, self.human_sides)
         if keep is None and not was_thinking:
             return
         if keep is not None:
-            self.moves = self.moves[:keep]
+            self.current = self.tree.ancestor(self.current, keep)   # the moves stay in the tree
             self.selected_sq = None
-            self.last_move = self.moves[-1] if self.moves else None
+            self.last_move = self.current.move
             self.notes.clear()
         self.sync_board()
         self.maybe_engine_move()
 
+    def on_redo(self, _):
+        """Step forward along the line you came from; against the engine: your move and its reply."""
+        was_thinking = self.thinking
+        self.cancel_engine_move()
+        node, steps = self.current, 0
+        while True:
+            nxt = self.tree.redo_child(node)
+            if nxt is None:
+                break
+            node, steps = nxt, steps + 1
+            if self.tree.stm_after(node) in self.human_sides:
+                break
+        if steps == 0 and not was_thinking:
+            return
+        if steps:
+            self.current = node
+            self.tree.visit(node)
+            self.selected_sq = None
+            self.last_move = node.move
+            self.notes.clear()
+        self.sync_board()
+        self.maybe_engine_move()
+
+    def go_to(self, node):
+        """Jump to any move of the game (move list click). The engine only carries on by itself when
+        this is the end of a line, so browsing an old game does not make it start thinking."""
+        if node is self.current:
+            return
+        self.cancel_engine_move()
+        self.current = node
+        self.tree.visit(node)
+        self.selected_sq = None
+        self.last_move = node.move
+        self.notes.clear()
+        self.sync_board()
+        if not node.children:
+            self.maybe_engine_move()
+
+    def push_move(self, uci):
+        """Play `uci` from the current position: follow the existing branch or add a new one."""
+        parent = self.current
+        child = parent.child_for(uci)
+        if child is None:
+            try:
+                san, fen = self.converter.san_move(self.start_fen, self.tree.moves(parent), uci)
+            except Exception:
+                san, fen = uci, None          # notation is cosmetic: never let it block a move
+            child = self.tree.add(parent, uci, san, fen)
+        self.current = child
+        self.tree.visit(child)
+        self.last_move = uci
+
     def on_flip(self, _):
         self.flipped = not self.flipped
         self.area.queue_draw()
+
+    @property
+    def moves(self):
+        """UCI moves from the start position to the position on the board."""
+        return self.tree.moves(self.current)
 
     def turn_color(self):
         parts = self.fen.split()
@@ -1164,6 +1707,8 @@ class DragonangaWindow(Gtk.Window):
         self.fen, self.legal_moves, self.in_check = self.engine.get_state(self.moves, self.start_fen)
         turn = "White" if self.turn_color() == "w" else "Black"
         mode = MODES[self.mode][1]
+        self.btn_undo.set_sensitive(undo_length(self.start_stm, self.current.ply, self.human_sides) is not None)
+        self.btn_redo.set_sensitive(self.tree.redo_child(self.current) is not None)
         if not self.legal_moves:
             prev_fen = None
             if self.moves:  # position before the last move, to tell a baremate from a stalemate
@@ -1172,19 +1717,17 @@ class DragonangaWindow(Gtk.Window):
         else:
             chk = " (IN CHECK!)" if self.in_check else ""
             self.status_label.set_text(
-                f"Mode: {mode} | Turn: {turn}{chk} | Legal moves: {len(self.legal_moves)} | "
+                f"Mode: {mode} | Move: {turn}{chk} | Legal moves: {len(self.legal_moves)} | "
                 f"FEN: {engine_fen_to_designer(self.fen)}"
             )
         self.area.queue_draw()
+        self.refresh_move_list()
         self.maybe_start_analysis()
 
     # ----- importing a position ------------------------------------------------
-    def load_position(self, text, notation=AUTO):
-        """Set the board from pasted FEN text.  Returns the notation that was detected.
-        Raises ValueError (with a readable message) and changes nothing if it is not usable."""
-        engine_fen, used = parse_import_fen(text, notation)
-        # The engine happily loads illegal positions, so check the one thing it cannot be
-        # trusted with: the side NOT to move must not already be in check.
+    def check_start_position(self, engine_fen):
+        """Raise ValueError unless the engine can load this position and the side NOT to move is not
+        already in check (the engine happily loads illegal positions, so this has to be checked here)."""
         fen, _, _ = self.oracle.get_state([], engine_fen, quiet=True)
         if not fen:
             raise ValueError("The engine could not load that position.")
@@ -1198,10 +1741,17 @@ class DragonangaWindow(Gtk.Window):
                 "Queen Fairy). Fix the board or the side to move."
             )
 
+    def load_position(self, text, notation=AUTO):
+        """Set the board from pasted FEN text.  Returns the notation that was detected.
+        Raises ValueError (with a readable message) and changes nothing if it is not usable."""
+        engine_fen, used = parse_import_fen(text, notation)
+        self.check_start_position(engine_fen)
+
         self.cancel_engine_move()
         self.cancel_analysis()
         self.start_fen, self.start_stm = engine_fen, engine_fen.split()[1]
-        self.moves = []
+        self.tree = GameTree(engine_fen)
+        self.current = self.tree.root
         self.selected_sq = None
         self.last_move = None
         self.notes.clear()
@@ -1250,6 +1800,139 @@ class DragonangaWindow(Gtk.Window):
             notation = NOTATION_CHOICES[idx][1] if 0 <= idx < len(NOTATION_CHOICES) else AUTO
             try:
                 self.load_position(entry.get_text(), notation)
+            except ValueError as e:
+                err.set_text(str(e))
+                continue
+            except Exception as e:  # e.g. the engine process died
+                err.set_text(f"Could not import: {e}")
+                continue
+            break
+        dialog.destroy()
+
+    # ----- PGN import / export ---------------------------------------------------------
+    def pgn_text(self):
+        """The whole game tree as PGN text.  The result is only filled in when the main line has
+        ended the game (checkmate, stalemate, baremate or the lone-Queen draw)."""
+        moves = self.tree.moves(self.tree.main_end())
+        result = "*"
+        fen, legal, in_check = self.oracle.get_state(moves, self.start_fen, quiet=True)
+        if fen and not legal:
+            prev_fen = self.oracle.get_state(moves[:-1], self.start_fen, quiet=True)[0] if moves else None
+            result = pgn_result(fen, in_check, prev_fen)
+        return tree_to_pgn(self.tree, result)
+
+    def import_pgn_text(self, text):
+        """Replace the game by the first game in this PGN text, variations included.  Raises
+        ValueError (readable message) and changes nothing if the text cannot be used."""
+        tree = pgn_to_tree(text, self.converter)
+        if tree.start_fen:
+            self.check_start_position(tree.start_fen)
+        self.cancel_engine_move()
+        self.cancel_analysis()
+        self.start_fen, self.start_stm = tree.start_fen, tree.start_stm
+        self.tree = tree
+        self.current = tree.main_end()               # show the end of the main line
+        tree.visit(self.current)
+        self.selected_sq = None
+        self.last_move = self.current.move
+        self.notes.clear()
+        self.engine.new_game()
+        self.set_eval("-- | PGN imported")
+        self.sync_board()
+        self.maybe_engine_move()
+
+    @staticmethod
+    def pgn_file_dialog(parent, title, action):
+        dialog = Gtk.FileChooserDialog(title=title, transient_for=parent, action=action)
+        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                           "Save" if action == Gtk.FileChooserAction.SAVE else "Open", Gtk.ResponseType.OK)
+        pgn = Gtk.FileFilter()
+        pgn.set_name("PGN files (*.pgn)")
+        pgn.add_pattern("*.pgn")
+        pgn.add_pattern("*.PGN")
+        dialog.add_filter(pgn)
+        everything = Gtk.FileFilter()
+        everything.set_name("All files")
+        everything.add_pattern("*")
+        dialog.add_filter(everything)
+        return dialog
+
+    def on_export_pgn(self, _):
+        try:
+            text = self.pgn_text()
+        except Exception as e:
+            show_error(f"Could not prepare the PGN:\n{e}", self)
+            return
+        dialog = self.pgn_file_dialog(self, "Export PGN", Gtk.FileChooserAction.SAVE)
+        dialog.set_do_overwrite_confirmation(True)
+        dialog.set_current_name("dragonanga.pgn")
+        path = dialog.get_filename() if dialog.run() == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".pgn"
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        except OSError as e:
+            show_error(f"Could not save the file:\n{path}\n\n{e}", self)
+
+    def on_import_pgn(self, _):
+        dialog = Gtk.Dialog(title="Import PGN", transient_for=self, flags=0)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Import", Gtk.ResponseType.OK)
+        dialog.set_default_size(560, 400)
+        box = dialog.get_content_area()
+        box.set_spacing(6)
+
+        intro = Gtk.Label(label="Paste a PGN below, or open a .pgn file. Moves use the designer letters "
+                                "(Sc3, Gb4, Qxe7+ ...); variations in brackets are kept.")
+        intro.set_xalign(0)
+        intro.set_line_wrap(True)
+        intro.set_max_width_chars(70)
+        box.pack_start(intro, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_shadow_type(Gtk.ShadowType.IN)
+        view = Gtk.TextView()
+        view.set_monospace(True)
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        scroll.add(view)
+        box.pack_start(scroll, True, True, 0)
+        buf = view.get_buffer()
+
+        err = Gtk.Label(label="")
+        err.set_xalign(0)
+        err.set_line_wrap(True)
+        err.set_max_width_chars(70)
+
+        def open_file(_btn):
+            chooser = self.pgn_file_dialog(dialog, "Open PGN file", Gtk.FileChooserAction.OPEN)
+            path = chooser.get_filename() if chooser.run() == Gtk.ResponseType.OK else None
+            chooser.destroy()
+            if not path:
+                return
+            try:
+                with open(path, encoding="utf-8-sig", errors="replace") as f:
+                    buf.set_text(f.read())
+                err.set_text("")
+            except OSError as e:
+                err.set_text(f"Could not read the file: {e}")
+
+        btn_open = Gtk.Button(label="Open file...")
+        btn_open.connect("clicked", open_file)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.pack_start(btn_open, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        box.pack_start(err, False, False, 0)
+
+        dialog.show_all()
+        while dialog.run() == Gtk.ResponseType.OK:
+            text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+            try:
+                self.import_pgn_text(text)
             except ValueError as e:
                 err.set_text(str(e))
                 continue
@@ -1316,8 +1999,7 @@ class DragonangaWindow(Gtk.Window):
         self.thinking = False
         self.engine_cancel = None
         if bestmove and bestmove != "(none)":
-            self.moves.append(bestmove)
-            self.last_move = bestmove
+            self.push_move(bestmove)
         self.sync_board()
         self.maybe_engine_move()
         return False
@@ -1468,8 +2150,7 @@ class DragonangaWindow(Gtk.Window):
         return matching_moves[0]
 
     def make_move(self, uci_move):
-        self.moves.append(uci_move)
-        self.last_move = uci_move
+        self.push_move(uci_move)
         self.notes.clear()
         self.sync_board()
         self.maybe_engine_move()
@@ -1635,9 +2316,10 @@ def pick_engine_executable():
     return path
 
 
-def show_error(text):
+def show_error(text, parent=None):
+    extra = {"transient_for": parent} if parent is not None else {}
     dialog = Gtk.MessageDialog(
-        message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE, text=text)
+        message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE, text=text, **extra)
     dialog.run()
     dialog.destroy()
 
