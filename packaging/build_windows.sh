@@ -34,6 +34,8 @@ python -m PyInstaller --noconfirm --windowed --name play_dragonanga \
 cp "$ENGINE" "$OUT/dist/play_dragonanga/dragonanga-engine.exe"
 cp packaging/README_windows.txt "$OUT/dist/play_dragonanga/README.txt"
 cp packaging/COPYING.txt "$OUT/dist/play_dragonanga/"
+# piece picture sets (the app looks for a pieces/ folder next to play_dragonanga.exe)
+if [ -d pieces ]; then cp -r pieces "$OUT/dist/play_dragonanga/pieces"; fi
 
 NAME=Dragonanga-windows-x64
 (cd "$OUT/dist" && python -m zipfile -c "../$NAME.zip" play_dragonanga)

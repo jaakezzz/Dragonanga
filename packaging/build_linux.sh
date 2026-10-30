@@ -27,6 +27,8 @@ cp packaging/play_dragonanga.sh "$OUT/$NAME/"
 cp "$ENGINE" "$OUT/$NAME/dragonanga-engine"
 cp packaging/README_linux.txt "$OUT/$NAME/README.txt"
 cp packaging/COPYING.txt "$OUT/$NAME/"
+# piece picture sets (the app looks for a pieces/ folder next to play_dragonanga.py)
+if [ -d pieces ]; then cp -r pieces "$OUT/$NAME/pieces"; fi
 chmod +x "$OUT/$NAME/play_dragonanga.sh" "$OUT/$NAME/dragonanga-engine"
 tar czf "$OUT/$NAME.tar.gz" -C "$OUT" "$NAME"
 rm -rf "$OUT/$NAME"

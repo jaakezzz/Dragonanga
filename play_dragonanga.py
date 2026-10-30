@@ -27,6 +27,11 @@ Analysis
                      (piece letter + square, x = capture, =F promotion, + check, # mate)
   * Eval is always from White's point of view: + = White ahead, - = Black ahead
 
+Pieces
+  * Pieces: drop-down   Simple tokens (built in) or any picture set found in the pieces/ folder,
+                        e.g. pieces/Handmade/white-soldier.png ... black-minister.png
+                        (python play_dragonanga.py --check-pieces tells you what was found)
+
 Drawing
   * Right click + drag   arrow (Shift red, Ctrl orange, Alt purple); right click a square = circle
   * Left click           select / move, and clears the drawings
@@ -507,7 +512,7 @@ def draw_circle(cr, sq, name, flipped, rgb, alpha=0.8):
     cr.stroke()
 
 
-def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, best_move):
+def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, best_move, images=None):
     sq = size / 8.0
     cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
 
@@ -544,9 +549,14 @@ def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, 
                 cr.move_to((c + 1) * sq - sq * 0.20, (r + 1) * sq - 4)
                 cr.show_text(name[0])
 
-            # Piece token
+            # Piece: a picture from the chosen set, or the built-in token
             piece = grid[br][bc]
-            if piece:
+            picture = images.get(piece, sq * PIECE_IMAGE_SCALE) if (piece and images) else None
+            if picture is not None:
+                side = picture.get_width()
+                cr.set_source_surface(picture, c * sq + (sq - side) / 2.0, r * sq + (sq - side) / 2.0)
+                cr.paint()
+            elif piece:
                 is_white = piece.isupper()
                 cx, cy = (c + 0.5) * sq, (r + 0.5) * sq
 
@@ -883,6 +893,9 @@ class DragonangaWindow(Gtk.Window):
         self.analysis_lines = []
         self.analysis_cancel = None
         self.analysis_gen = 0
+        self.piece_sets = find_piece_sets()    # {name: {(color, word): file}}
+        self.piece_set_names = [TOKENS] + list(self.piece_sets)
+        self.piece_images = None               # None = built-in tokens
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         vbox.set_margin_top(8)
@@ -966,6 +979,19 @@ class DragonangaWindow(Gtk.Window):
         self.make_compact(btn_undo)
         eval_row.pack_end(btn_undo, False, False, 0)
 
+        # Piece style: only shown when there are picture sets to choose from
+        if self.piece_sets:
+            self.piece_combo = Gtk.ComboBoxText()
+            for name in self.piece_set_names:
+                self.piece_combo.append_text(name)
+            self.piece_combo.set_tooltip_text("Piece style")
+            start = DEFAULT_PIECE_SET if DEFAULT_PIECE_SET in self.piece_set_names else TOKENS
+            self.piece_combo.set_active(self.piece_set_names.index(start))
+            self.piece_combo.connect("changed", self.on_piece_set_changed)
+            eval_row.pack_end(self.piece_combo, False, False, 0)
+            eval_row.pack_end(Gtk.Label(label="Pieces:"), False, False, 0)
+            self.load_piece_set(start)   # no redraw needed yet: the board is not built
+
         # Engine lines panel (only visible while "Show lines" is ticked)
         self.lines_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.line_labels = []
@@ -994,6 +1020,22 @@ class DragonangaWindow(Gtk.Window):
 
         self.set_mode("white")
         self.new_game()
+
+    def load_piece_set(self, name):
+        """Select the named picture set (TOKENS = the built-in drawn pieces)."""
+        files = self.piece_sets.get(name)
+        self.piece_images = PieceImages(files) if files else None
+        if files and len(files) < len(ALL_PIECE_KEYS):
+            print(f"[PIECES] '{name}' is incomplete, missing pieces are drawn as tokens")
+
+    def use_piece_set(self, name):
+        self.load_piece_set(name)
+        self.area.queue_draw()
+
+    def on_piece_set_changed(self, combo):
+        idx = combo.get_active()
+        if 0 <= idx < len(self.piece_set_names):
+            self.use_piece_set(self.piece_set_names[idx])
 
     def set_eval(self, text):
         """Remember the latest evaluation text; it is only shown while the Eval box is ticked."""
@@ -1446,10 +1488,116 @@ class DragonangaWindow(Gtk.Window):
         draw_board(
             cr, size, self.parse_fen_grid(), self.flipped, self.selected_sq, targets,
             self.last_move, self.notes, self.best_move if self.best_chk.get_active() else None,
+            self.piece_images,
         )
 
 
 ENGINE_NAMES = ("dragonanga-engine", "stockfish", "fairy-stockfish")
+
+# ---------------------------------------------------------------------------
+# Piece picture sets:  pieces/<set name>/<white|black>-<piece>.png
+# ---------------------------------------------------------------------------
+TOKENS = "Simple tokens"          # the built-in drawn pieces; always available
+DEFAULT_PIECE_SET = TOKENS        # set this to e.g. "Handmade" to start with pictures
+PIECE_IMAGE_SCALE = 0.92          # picture size as a fraction of the square
+PIECE_WORDS = {e: name.lower().replace(" ", "-") for e, (_, name) in PIECE_DISPLAY.items()}
+#   {'P': 'soldier', 'I': 'guard', 'E': 'elephant', 'H': 'horse', 'D': 'dragon',
+#    'K': 'queen-fairy', 'C': 'king', 'F': 'fairy', 'M': 'minister'}
+ALL_PIECE_KEYS = [(color, word) for color in ("white", "black") for word in PIECE_WORDS.values()]
+
+
+def piece_key(piece):
+    """Board letter (engine letter, upper case = White) -> ('white', 'queen-fairy')."""
+    return ("white" if piece.isupper() else "black", PIECE_WORDS.get(piece.upper()))
+
+
+def find_piece_sets(dirs=None):
+    """Scan <dir>/pieces/*/ for picture sets.  Returns {set name: {(color, word): file path}}.
+
+    A set's name is its folder name.  File names are matched loosely: 'White-Queen_Fairy.PNG'
+    works as well as 'white-queen-fairy.png'.  Folders without any recognised piece are ignored,
+    and a set that lacks some pieces is still listed (the missing ones are drawn as tokens)."""
+    sets = {}
+    for folder in (dirs if dirs is not None else app_dirs()):
+        root = os.path.join(folder, "pieces")
+        try:
+            names = sorted(os.listdir(root), key=str.lower)
+        except OSError:
+            continue
+        for set_name in names:
+            path = os.path.join(root, set_name)
+            if set_name in sets or not os.path.isdir(path):
+                continue
+            files = {}
+            for fname in sorted(os.listdir(path)):
+                stem, ext = os.path.splitext(fname)
+                if ext.lower() != ".png":
+                    continue
+                key = tuple(re.sub(r"[\s_]+", "-", stem.strip().lower()).split("-", 1))
+                if key in ALL_PIECE_KEYS:
+                    files[key] = os.path.join(path, fname)
+            if files:
+                sets[set_name] = files
+    return sets
+
+
+def piece_set_report(sets):
+    """Plain-text summary of what find_piece_sets() found, with the missing pieces named."""
+    if not sets:
+        return "No piece sets found. Expected pieces/<set name>/white-soldier.png etc. next to the app."
+    lines = []
+    for name, files in sets.items():
+        missing = [f"{c}-{w}" for c, w in ALL_PIECE_KEYS if (c, w) not in files]
+        status = "complete" if not missing else f"missing {len(missing)}: " + ", ".join(missing)
+        lines.append(f"{name}: {len(files)} of {len(ALL_PIECE_KEYS)} pieces, {status}")
+    return "\n".join(lines)
+
+
+class PieceImages:
+    """The pictures of one set, ready to draw.  Scaled copies are cached per size so the board
+    stays fast and looks sharp at any window size."""
+
+    def __init__(self, files):
+        self.files = files
+        self.originals = {}   # key -> cairo surface, or None if the file could not be read
+        self.scaled = {}      # (key, pixels) -> cairo surface
+
+    def _original(self, key):
+        if key not in self.originals:
+            surface = None
+            path = self.files.get(key)
+            if path:
+                try:
+                    surface = cairo.ImageSurface.create_from_png(path)
+                except Exception as e:  # unreadable or not really a PNG
+                    print(f"[PIECES] cannot read {path}: {e}")
+            self.originals[key] = surface
+        return self.originals[key]
+
+    def get(self, piece, pixels):
+        """Surface (pixels x pixels, transparent) for a board letter, or None -> draw a token."""
+        key = piece_key(piece)
+        pixels = max(1, int(pixels))
+        hit = self.scaled.get((key, pixels))
+        if hit is None:
+            src = self._original(key)
+            if src is None:
+                return None
+            w, h = src.get_width(), src.get_height()
+            if w <= 0 or h <= 0:
+                return None
+            scale = pixels / float(max(w, h))      # keeps the aspect ratio of non-square pictures
+            hit = cairo.ImageSurface(cairo.FORMAT_ARGB32, pixels, pixels)
+            ctx = cairo.Context(hit)
+            ctx.translate((pixels - w * scale) / 2.0, (pixels - h * scale) / 2.0)
+            ctx.scale(scale, scale)
+            ctx.set_source_surface(src, 0, 0)
+            ctx.get_source().set_filter(cairo.FILTER_BEST)   # smooth down- and up-scaling
+            ctx.paint()
+            if len(self.scaled) > 400:
+                self.scaled.clear()
+            self.scaled[(key, pixels)] = hit
+        return hit
 
 
 def app_dirs():
@@ -1495,6 +1643,9 @@ def show_error(text):
 
 
 if __name__ == "__main__":
+    if "--check-pieces" in sys.argv:       # no window: just report what is in the pieces/ folder
+        print(piece_set_report(find_piece_sets()))
+        sys.exit(0)
     # Engine: a path given on the command line or in DRAGONANGA_ENGINE, else the one shipped with
     # the app, else ask.
     exe = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("DRAGONANGA_ENGINE")) \
