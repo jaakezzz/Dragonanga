@@ -17,15 +17,23 @@ Position
 
 Engine strength
   * Strength 1-8     how well the engine plays when it moves (1 weakest, 8 full strength).
-                     Analysis ("Show best move" / "Show lines") always runs at full strength.
+                     The analysis (Eval / Lines / Suggestion) always runs at full strength.
                      At 8 the engine thinks for the Think Time below; levels 1-7 use short
                      fixed times, like the levels on Lichess.
 
-Analysis
-  * Show best move   blue arrow for the engine's best move on your turn
-  * Show lines       the engine's 3 best continuations, written in designer notation
-                     (piece letter + square, x = capture, =F promotion, + check, # mate)
-  * Eval is always from White's point of view: + = White ahead, - = Black ahead
+Analysis (a second engine analyses the position on the board all the time, in every mode)
+  * Eval [ ]         bar + score + depth, from White's point of view: +0.3 = White is ahead
+  * Lines [ ]        the engine's best lines in designer notation (piece letter + square, x = capture,
+                     =F promotion, + check, # mate), in a box beside two spin boxes:
+                     Lines (1-5 lines worked out) and Threads (CPU threads used, default 2)
+  * Suggestion [ ]   blue arrow for the engine's best move on your turn
+  The three boxes only show or hide things; they never restart the engine's calculation. It only
+  starts again when the position changes, or when you change Lines or Threads.
+
+Settings (settings.json in your user folder; delete it to start again with the defaults)
+  Remembered: piece set, Eval / Lines / Suggestion / Move List, number of lines and threads.
+  Windows %APPDATA%\\Dragonanga, Linux ~/.config/Dragonanga (or $DRAGONANGA_CONFIG for any file).
+  The game itself is never saved: the app always starts a new game.
 
 Move list
   * Move List        tick it to show the game next to the board in designer notation. Click a move
@@ -47,6 +55,7 @@ import bisect
 import collections
 import datetime
 import html
+import json
 import math
 import os
 import re
@@ -57,7 +66,7 @@ import cairo
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gdk, GLib
+from gi.repository import Gtk, Gdk, GLib, Pango
 
 # ---------------------------------------------------------------------------
 # Piece display and notation.  The ENGINE letters are the ones in variant.cpp,
@@ -96,8 +105,13 @@ MODES = {
 
 SIDE_WIDTH = 250   # width of the move list panel in pixels
 MAX_INDENT = 8     # deepest variation level that is indented further
-NUM_LINES = 3      # "Show lines" shows this many continuations
+DEFAULT_LINES = 3  # engine lines calculated / shown to start with
+MAX_LINES = 5      # most lines the Lines box can show
+DEFAULT_THREADS = 2
 MAX_PLIES = 10     # plies shown per line
+ANALYSIS_HASH_MB = 128    # memory of the always-on analysis engine
+LINES_BOX_HEIGHT = 76     # pixels: the Lines box is about three lines tall, more lines scroll
+WINDOW_SIZE = (840, 780)  # wide enough for the toolbar; the move list fits in the space beside the board
 
 # Strength levels 1-8, the same scheme the Lichess / Pychess AI levels use: Fairy-Stockfish's
 # "Skill Level" option (it deliberately picks weaker moves) plus a depth cap and a time limit per
@@ -209,10 +223,13 @@ def parse_info_line(line, stm):
     if " lowerbound" in line or " upperbound" in line:
         return None
     sign = 1 if stm == "w" else -1
+    cp = mate = None
     if mate_m:
-        score = f"#{int(mate_m.group(1)) * sign}"  # '#3' White mates in 3, '#-3' Black mates in 3
+        mate = int(mate_m.group(1)) * sign
+        score = f"#{mate}"  # '#3' White mates in 3, '#-3' Black mates in 3
     else:
-        score = f"{int(cp_m.group(1)) * sign / 100.0:+.2f}"
+        cp = int(cp_m.group(1)) * sign
+        score = f"{cp / 100.0:+.2f}"
     depth_m = re.search(r"\bdepth\s+(\d+)", line)
     mpv_m = re.search(r"\bmultipv\s+(\d+)", line)
     pv_m = re.search(r"\bpv\s+(.+)$", line)
@@ -220,6 +237,8 @@ def parse_info_line(line, stm):
         "depth": int(depth_m.group(1)) if depth_m else None,
         "multipv": int(mpv_m.group(1)) if mpv_m else 1,
         "score": score,
+        "cp": cp,          # centipawns from White's point of view (None when there is a mate score)
+        "mate": mate,      # moves to mate, + = White mates, - = Black mates (None when there is none)
         "pv": pv_m.group(1).split() if pv_m else [],
     }
 
@@ -229,9 +248,105 @@ def format_eval(info):
     return f"{info['score']} | Depth: {depth}"
 
 
+def format_eval_short(info):
+    """Score for the eval bar: one decimal ('+0.3', '-1.2') or a mate ('#3', '#-3')."""
+    if info is None:
+        return "--"
+    if info.get("mate") is not None:
+        return f"#{info['mate']}"
+    tenths = int(abs(info["cp"]) / 10.0 + 0.5)          # rounded half up, the same for both signs
+    if tenths == 0:
+        return "+0.0"                                   # never "-0.0"
+    return f"{'-' if info['cp'] < 0 else '+'}{tenths / 10.0:.1f}"
+
+
+def eval_fraction(info):
+    """How much of the eval bar is White's (0 = Black is winning, 1 = White is winning).  The same
+    curve Lichess uses for its bar: 50 % at 0.00, ~73 % at +1.00, ~97 % at +10."""
+    if info is None:
+        return 0.5
+    if info.get("mate") is not None:
+        return 1.0 if info["mate"] > 0 else 0.0
+    return 1.0 / (1.0 + math.exp(-0.00368208 * info["cp"]))
+
+
 def format_line_row(info):
     depth = info["depth"] if info["depth"] is not None else "?"
     return f"{info['score']:>7}  d{depth:<3} {info.get('text', '')}"
+
+
+# ----- settings file ---------------------------------------------------------
+SETTINGS_DEFAULTS = {
+    "piece_set": None,          # name of the piece set (None = the default one)
+    "show_eval": True,
+    "show_lines": False,
+    "show_suggestion": False,
+    "show_move_list": False,
+    "lines": DEFAULT_LINES,
+    "threads": DEFAULT_THREADS,
+}
+
+
+def max_threads():
+    """Most threads the Threads box offers: one per logical CPU of this computer (at most 32)."""
+    return max(1, min(32, os.cpu_count() or 4))
+
+
+def settings_path():
+    """Where the settings live: DRAGONANGA_CONFIG if set, else the usual per-user config folder."""
+    override = os.environ.get("DRAGONANGA_CONFIG")
+    if override:
+        return override
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+    elif sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "Dragonanga", "settings.json")
+
+
+def sanitize_settings(raw):
+    """Settings read from a file -> a complete dict with every value valid (bad or missing ones fall
+    back to the defaults, so a damaged or hand-edited file can never break the start-up)."""
+    out = dict(SETTINGS_DEFAULTS)
+    if not isinstance(raw, dict):
+        return out
+    for key in ("show_eval", "show_lines", "show_suggestion", "show_move_list"):
+        if isinstance(raw.get(key), bool):
+            out[key] = raw[key]
+    for key, low, high in (("lines", 1, MAX_LINES), ("threads", 1, max_threads())):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            out[key] = max(low, min(high, value))
+    if isinstance(raw.get("piece_set"), str):
+        out["piece_set"] = raw["piece_set"]
+    out["threads"] = min(out["threads"], max_threads())
+    return out
+
+
+def load_settings(path=None):
+    try:
+        with open(path or settings_path(), encoding="utf-8") as f:
+            return sanitize_settings(json.load(f))
+    except (OSError, ValueError):
+        return sanitize_settings(None)       # no file yet, or an unreadable one: defaults
+
+
+def save_settings(values, path=None):
+    """Write the settings file (through a temporary file, so a crash cannot leave half a file).
+    Returns False if it could not be written; the app carries on either way."""
+    path = path or settings_path()
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(values, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
 
 
 # ----- FEN / letter conversion ---------------------------------------------
@@ -957,6 +1072,37 @@ def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, 
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
+def draw_eval_bar(cr, width, height, white_share):
+    """The evaluation bar: White's share is the light part on the left, Black's the dark part."""
+    r = min(height / 2.0, 8.0)
+    x, y, w, h = 0.5, 0.5, width - 1.0, height - 1.0
+
+    def outline():
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+
+    cr.save()
+    outline()
+    cr.clip()
+    cr.set_source_rgb(0.18, 0.18, 0.18)
+    cr.paint()
+    cr.set_source_rgb(0.96, 0.96, 0.96)
+    cr.rectangle(0, 0, width * max(0.0, min(1.0, white_share)), height)
+    cr.fill()
+    cr.set_source_rgba(0.5, 0.5, 0.5, 0.9)           # thin mark at 0.00
+    cr.rectangle(width / 2.0 - 0.5, 0, 1, height)
+    cr.fill()
+    cr.restore()
+    outline()
+    cr.set_source_rgb(0.45, 0.45, 0.45)
+    cr.set_line_width(1)
+    cr.stroke()
+
+
 class UCIEngine:
     def __init__(self, exe_path):
         self.proc = subprocess.Popen(
@@ -972,6 +1118,7 @@ class UCIEngine:
         self._wlock = threading.Lock()      # keeps single commands from interleaving
         self._stop_lock = threading.Lock()  # guards _active_cancel
         self._active_cancel = None          # cancel token of the search that is running now
+        self.sent_options = {}              # options set through search(options=...), to send changes only
         self.send("uci")
         self.wait_for("uciok")
         self.send("setoption name UCI_Variant value dragonanga")
@@ -989,6 +1136,10 @@ class UCIEngine:
             pass
         try:
             self.proc.terminate()
+        except Exception:
+            pass
+        try:
+            self.proc.stdin.close()      # nothing left to flush into the dead pipe
         except Exception:
             pass
 
@@ -1045,7 +1196,7 @@ class UCIEngine:
             return fen, legal_moves, bool(checkers)
 
     def search(self, moves, movetime_ms, info_callback, cancel=None, multipv=1, start_fen=None,
-               skill=FULL_SKILL, depth=None):
+               skill=FULL_SKILL, depth=None, options=None):
         """Run an engine search and return bestmove.
 
         movetime_ms=None means 'go infinite' (background analysis); it only ends
@@ -1053,10 +1204,20 @@ class UCIEngine:
         time this search gets its turn, nothing is run.
         skill / depth handicap the search (see STRENGTH_LEVELS); every search sets the skill
         explicitly, so analysis always runs at full strength.
+        options: extra engine options ({"Threads": 2, "Hash": 128}); an option is only sent when its
+        value is different from the last one sent, because changing Threads / Hash is expensive.
         """
         with self.lock:
             if cancel is not None and cancel.is_set():
                 return None
+            changed = False
+            for name, value in (options or {}).items():
+                if self.sent_options.get(name) != value:
+                    self.send(f"setoption name {name} value {value}")
+                    self.sent_options[name] = value
+                    changed = True
+            if changed:
+                self.wait_ready()
             self.send(f"setoption name MultiPV value {multipv}")
             self.send(f"setoption name Skill Level value {skill}")
             self.send(position_cmd(start_fen, moves))
@@ -1165,8 +1326,10 @@ class InfoPump:
     converts the principal variations to designer notation at most ~8 times a second,
     then hands the finished results to `publish` (a list of dicts sorted by line number)."""
 
-    def __init__(self, converter, start_fen, moves, stm, fullmove, cancel, publish, max_lines, interval=0.12):
+    def __init__(self, converter, start_fen, moves, stm, fullmove, cancel, publish, max_lines, interval=0.15,
+                 need_text=lambda: True):
         self.converter, self.start_fen, self.moves = converter, start_fen, moves
+        self.need_text = need_text      # False while the lines are hidden: only scores and moves are needed
         self.stm, self.fullmove = stm, fullmove
         self.cancel, self.publish = cancel, publish
         self.max_lines, self.interval = max_lines, interval
@@ -1215,7 +1378,7 @@ class InfoPump:
                 snapshot = [self.latest[k] for k in sorted(self.latest)]
             results = []
             for info in snapshot:
-                text = self._text(info)
+                text = self._text(info) if self.need_text() else ""
                 if text is None:
                     return
                 results.append(dict(info, text=text))
@@ -1224,18 +1387,99 @@ class InfoPump:
             self.done.wait(self.interval)
 
 
+class Analyzer:
+    """Keeps one engine process analysing the position on the board the whole time ("go infinite"),
+    whatever the mode and whatever is shown, so the evaluation is always the same and always live.
+
+    * It only restarts when the POSITION changes, or the number of lines / threads is changed.
+      Showing or hiding the eval, lines or suggestion, switching sides and so on never touch it.
+    * It is a separate process from the one that plays the moves, so playing never interrupts it.
+    * Results go to publish(generation, results); the window ignores results of an old generation."""
+
+    def __init__(self, engine_path, converter, publish):
+        self.engine = UCIEngine(engine_path)
+        self.converter, self.publish = converter, publish
+        self.key = None              # (start_fen, moves, lines, threads) being analysed now
+        self.cancel = None
+        self.pump = None
+        self.gen = 0                 # grows with every restart / stop
+        self.want_text = False       # True while the Lines box is visible (notation is only built then)
+
+    def analyse(self, start_fen, moves, stm, fullmove, lines, threads, fresh=False):
+        """Point the analysis at this position.  Returns True if a new search was started and False if
+        the engine was already analysing exactly this (then nothing is touched).  fresh=True also
+        clears the engine's memory first (a new game)."""
+        key = (start_fen, tuple(moves), lines, threads)
+        if key == self.key and self.cancel is not None and not fresh:
+            return False
+        self._stop_search()
+        self.key = key
+        self.gen += 1
+        gen = self.gen
+        cancel = threading.Event()
+        self.cancel = cancel
+        pump = InfoPump(self.converter, start_fen, list(moves), stm, fullmove, cancel,
+                        lambda results: self.publish(gen, results), lines, need_text=lambda: self.want_text)
+        self.pump = pump
+        pump.start()
+        moves = list(moves)
+
+        def worker():
+            try:
+                if fresh and not cancel.is_set():
+                    self.engine.new_game()
+                self.engine.search(moves, None, pump.feed, cancel=cancel, multipv=lines, start_fen=start_fen,
+                                   options={"Threads": threads, "Hash": ANALYSIS_HASH_MB})
+            except (OSError, ValueError):
+                pass                      # the engine process is gone (the window is closing)
+            finally:
+                pump.close()
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def nudge(self):
+        """Publish the latest results again soon (used when the Lines box is switched on)."""
+        if self.pump is not None:
+            self.pump.wake.set()
+
+    def _stop_search(self):
+        if self.cancel is not None:
+            self.engine.request_stop(self.cancel)
+            self.cancel = None
+
+    def stop(self):
+        """Stop analysing (game over)."""
+        self._stop_search()
+        self.key = None
+        self.gen += 1
+
+    def close(self):
+        self.stop()
+        self.engine.close()
+
+
 # ---------------------------------------------------------------------------
 # Window
 # ---------------------------------------------------------------------------
 class DragonangaWindow(Gtk.Window):
     def __init__(self, engine_path):
         super().__init__(title="Dragonanga Engine Tester (Fairy-Stockfish)")
-        self.set_default_size(660, 720)
+        self.prefs_path = settings_path()
+        self.prefs = load_settings(self.prefs_path)
+        self.loading_prefs = True              # nothing is saved while the saved values are applied
+        width, height = WINDOW_SIZE
+        if self.prefs["show_lines"]:
+            height += LINES_BOX_HEIGHT + 8     # room for the Lines box, so the board keeps its size
+        self.set_default_size(width, height)
         self.connect("destroy", self.on_destroy)
 
-        self.engine = UCIEngine(engine_path)   # searches
+        self.engine = UCIEngine(engine_path)   # plays the engine's moves
         self.oracle = UCIEngine(engine_path)   # rules questions for the notation converter
         self.converter = NotationConverter(self.oracle)
+        # always-on analysis (evaluation, suggestion, lines) on a third engine process
+        self.analyzer = Analyzer(engine_path, self.converter,
+                                 lambda gen, results: GLib.idle_add(self.on_analysis_lines, gen, results))
 
         self.start_fen = None                  # None = normal start position, else an imported engine FEN
         self.start_stm = "w"
@@ -1255,13 +1499,21 @@ class DragonangaWindow(Gtk.Window):
         self.last_move = None
         self.flipped = False
         self.notes = Annotations()
-        self.best_move = None
-        self.analysis_lines = []
-        self.analysis_cancel = None
-        self.analysis_gen = 0
+        self.best_move = None                  # the engine's best move here (the Suggestion arrow)
+        self.analysis_lines = []               # latest results of the always-on analysis
+        self.analysis_fresh = True             # the next analysis starts with a cleared engine memory
+        self.final_outcome = None              # set while the game on the board is over
+        self.eval_info = None
+        self.bar_pos = self.bar_target = 0.5   # eval bar: where it is drawn / where it is heading
+        self.bar_timer = None
+        self.lines_shown = False
+        self.line_cache = None                 # what the Lines box shows now: (number of lines, texts)
+        self.lines_delta = 0                   # window height added when the Lines box was shown
+        self.side_shown = False
         self.piece_sets = find_piece_sets()    # {name: {(color, word): file}}
         self.piece_set_names = [TOKENS] + list(self.piece_sets)
         self.piece_images = None               # None = built-in tokens
+        self.piece_set_name = TOKENS
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         vbox.set_margin_top(8)
@@ -1288,7 +1540,7 @@ class DragonangaWindow(Gtk.Window):
         self.strength_spin.set_value(DEFAULT_STRENGTH)
         self.strength_spin.set_tooltip_text(
             "How strong the engine is when it plays a move: 1 = weakest, 8 = full strength.\n"
-            "Analysis (best move arrow, lines) always uses full strength.")
+            "The analysis (Eval, Lines, Suggestion) always uses full strength.")
         self.pack_spin_right(row1, "Strength (1-8):", self.strength_spin)
 
         # Row 2: position and view
@@ -1303,13 +1555,10 @@ class DragonangaWindow(Gtk.Window):
         btn_flip.connect("clicked", self.on_flip)
         row2.pack_start(btn_flip, False, False, 0)
 
-        self.best_chk = Gtk.CheckButton(label="Show best move")
-        self.best_chk.connect("toggled", self.on_analysis_option_toggled)
-        row2.pack_start(self.best_chk, False, False, 0)
-
-        self.lines_chk = Gtk.CheckButton(label="Show lines")
-        self.lines_chk.connect("toggled", self.on_analysis_option_toggled)
-        row2.pack_start(self.lines_chk, False, False, 0)
+        # The three view toggles.  They only show or hide things: the engine analyses all the time.
+        self.eval_chk = self.add_toggle(row2, "Eval", "Show the evaluation bar (White's point of view)")
+        self.lines_chk = self.add_toggle(row2, "Lines", "Show the engine's best lines")
+        self.best_chk = self.add_toggle(row2, "Suggestion", "Draw the engine's best move on the board")
 
         self.time_spin = Gtk.SpinButton.new_with_range(0.5, 30.0, 0.5)
         self.time_spin.set_value(2.0)
@@ -1324,21 +1573,26 @@ class DragonangaWindow(Gtk.Window):
         eval_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         vbox.pack_start(eval_row, False, False, 2)
 
-        # "Eval [x]: +0.35 | Depth: 12" -- the checkbox shows / hides the evaluation text
-        eval_title = Gtk.Label(label="Eval")
-        eval_title.set_tooltip_text("From White's point of view: + = White ahead, - = Black ahead")
-        eval_row.pack_start(eval_title, False, False, 0)
-
-        self.eval_chk = Gtk.CheckButton()
-        self.eval_chk.set_active(True)
-        self.eval_chk.set_tooltip_text("Show or hide the evaluation")
-        self.eval_chk.connect("toggled", lambda _: self.refresh_eval())
-        eval_row.pack_start(self.eval_chk, False, False, 0)
-
-        self.eval_text = "-- | Depth: --"
-        self.eval_label = Gtk.Label(label=": " + self.eval_text)
-        self.eval_label.set_xalign(0)
-        eval_row.pack_start(self.eval_label, True, True, 0)
+        # "+0.3 [=====bar=====] Depth: 18" -- shown while the Eval toggle is ticked
+        self.eval_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.eval_score = Gtk.Label(label="--")
+        self.eval_score.set_width_chars(5)
+        self.eval_score.set_xalign(1)
+        self.eval_score.set_tooltip_text("From White's point of view: + = White ahead, - = Black ahead, # = mate")
+        self.eval_box.pack_start(self.eval_score, False, False, 0)
+        self.eval_bar = Gtk.DrawingArea()
+        self.eval_bar.set_size_request(100, 14)
+        self.eval_bar.set_valign(Gtk.Align.CENTER)
+        self.eval_bar.connect("draw", self.on_draw_eval)
+        self.eval_box.pack_start(self.eval_bar, True, True, 0)
+        self.eval_depth = Gtk.Label(label="Depth: --")
+        self.eval_depth.set_width_chars(10)
+        self.eval_depth.set_xalign(0)
+        self.eval_box.pack_start(self.eval_depth, False, False, 0)
+        for widget in (self.eval_score, self.eval_bar, self.eval_depth):
+            widget.show()                      # shown individually: show_all() skips the hidden box
+        self.eval_box.set_no_show_all(True)
+        eval_row.pack_start(self.eval_box, True, True, 0)
 
         # Right end of the line, right to left: Move List, Redo Move, Undo Move, then the piece style
         self.move_chk = Gtk.CheckButton(label="Move List")
@@ -1362,24 +1616,56 @@ class DragonangaWindow(Gtk.Window):
             for name in self.piece_set_names:
                 self.piece_combo.append_text(name)
             self.piece_combo.set_tooltip_text("Piece style")
-            start = DEFAULT_PIECE_SET if DEFAULT_PIECE_SET in self.piece_set_names else TOKENS
+            wanted = self.prefs["piece_set"] or DEFAULT_PIECE_SET
+            start = wanted if wanted in self.piece_set_names else TOKENS
             self.piece_combo.set_active(self.piece_set_names.index(start))
             self.piece_combo.connect("changed", self.on_piece_set_changed)
             eval_row.pack_end(self.piece_combo, False, False, 0)
             eval_row.pack_end(Gtk.Label(label="Pieces:"), False, False, 0)
             self.load_piece_set(start)   # no redraw needed yet: the board is not built
 
-        # Engine lines panel (only visible while "Show lines" is ticked)
-        self.lines_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        # Engine lines: a box of fixed height (about three lines, more lines scroll) with the number of
+        # lines and the number of threads beside it.  Visible while the Lines toggle is ticked.
+        self.lines_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_shadow_type(Gtk.ShadowType.IN)
+        scroll.set_size_request(-1, LINES_BOX_HEIGHT)
+        scroll.set_min_content_height(LINES_BOX_HEIGHT)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        inner.set_margin_start(6)
+        inner.set_margin_top(3)
+        inner.set_margin_bottom(3)
         self.line_labels = []
-        for _ in range(NUM_LINES):
+        for _ in range(MAX_LINES):
             lbl = Gtk.Label(label="")
             lbl.set_xalign(0)
-            lbl.show()  # shown individually: show_all() skips the hidden panel below
-            self.lines_box.pack_start(lbl, False, False, 0)
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            inner.pack_start(lbl, False, False, 0)
             self.line_labels.append(lbl)
-        self.lines_box.set_no_show_all(True)
-        vbox.pack_start(self.lines_box, False, False, 2)
+        scroll.add(inner)
+        self.lines_row.pack_start(scroll, True, True, 0)
+
+        controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        controls.set_valign(Gtk.Align.CENTER)
+        self.lines_spin = Gtk.SpinButton.new_with_range(1, MAX_LINES, 1)
+        self.lines_spin.set_value(self.prefs["lines"])
+        self.lines_spin.set_tooltip_text(
+            f"How many lines the engine works out (1-{MAX_LINES}). The evaluation is the top line.\n"
+            "More lines slow the search down a little.")
+        self.pack_spin_row(controls, "Lines:", self.lines_spin)
+        self.threads_spin = Gtk.SpinButton.new_with_range(1, max_threads(), 1)
+        self.threads_spin.set_value(self.prefs["threads"])
+        self.threads_spin.set_tooltip_text(
+            f"CPU threads the analysis may use (1-{max_threads()}, the number of processors in this computer).\n"
+            "More threads reach deeper in the same time.")
+        self.pack_spin_row(controls, "Threads:", self.threads_spin)
+        controls.show()
+        self.lines_row.pack_start(controls, False, False, 0)
+        for widget in (scroll, inner, *self.line_labels):
+            widget.show()
+        self.lines_row.set_no_show_all(True)
+        vbox.pack_start(self.lines_row, False, False, 2)
 
         # Board drawing area
         self.area = Gtk.DrawingArea()
@@ -1398,8 +1684,20 @@ class DragonangaWindow(Gtk.Window):
         body.pack_start(self.area, True, True, 0)
         self.build_move_panel(body)
 
+        # connect the view toggles and the spin boxes, then apply the saved settings
+        self.eval_chk.connect("toggled", self.on_eval_toggled)
+        self.lines_chk.connect("toggled", self.on_lines_toggled)
+        self.best_chk.connect("toggled", self.on_suggestion_toggled)
+        self.lines_spin.connect("value-changed", self.on_analysis_setting_changed)
+        self.threads_spin.connect("value-changed", self.on_analysis_setting_changed)
+        self.eval_chk.set_active(self.prefs["show_eval"])
+        self.lines_chk.set_active(self.prefs["show_lines"])
+        self.best_chk.set_active(self.prefs["show_suggestion"])
+        self.move_chk.set_active(self.prefs["show_move_list"])
+
         self.set_mode("white")
         self.new_game()
+        self.loading_prefs = False
 
     # ----- move list panel -------------------------------------------------------
     def build_move_panel(self, body):
@@ -1447,19 +1745,25 @@ class DragonangaWindow(Gtk.Window):
         body.pack_start(self.side, False, False, 0)
 
     def on_move_list_toggled(self, chk):
-        width, height = self.get_size()
-        if chk.get_active():
-            # grow the window by the panel width, minus the blank space beside the board
-            alloc = self.area.get_allocation()
-            gap = max(0, alloc.width - min(alloc.width, alloc.height))
-            self.side_delta = max(0, SIDE_WIDTH + 8 - gap)
+        show = chk.get_active()
+        if show == self.side_shown:
+            return
+        self.side_shown = show
+        if show:
             self.side.show()
-            self.resize(width + self.side_delta, height)
+            self.side_delta = 0
+            if not self.loading_prefs:
+                # grow the window by the panel width, minus the blank space beside the board
+                alloc = self.area.get_allocation()
+                gap = max(0, alloc.width - min(alloc.width, alloc.height))
+                self.side_delta = max(0, SIDE_WIDTH + 8 - gap)
+                self.grow_window(dw=self.side_delta)
             self.refresh_move_list()
         else:
             self.side.hide()
-            self.resize(max(1, width - self.side_delta), height)
+            self.grow_window(dw=-self.side_delta)
             self.side_delta = 0
+        self.save_prefs()
 
     def refresh_move_list(self):
         """Rebuild the move list text from the game tree and highlight the current move."""
@@ -1509,6 +1813,7 @@ class DragonangaWindow(Gtk.Window):
     def load_piece_set(self, name):
         """Select the named picture set (TOKENS = the built-in drawn pieces)."""
         files = self.piece_sets.get(name)
+        self.piece_set_name = name
         self.piece_images = PieceImages(files) if files else None
         if files and len(files) < len(ALL_PIECE_KEYS):
             print(f"[PIECES] '{name}' is incomplete, missing pieces are drawn as tokens")
@@ -1516,19 +1821,150 @@ class DragonangaWindow(Gtk.Window):
     def use_piece_set(self, name):
         self.load_piece_set(name)
         self.area.queue_draw()
+        self.save_prefs()
 
     def on_piece_set_changed(self, combo):
         idx = combo.get_active()
         if 0 <= idx < len(self.piece_set_names):
             self.use_piece_set(self.piece_set_names[idx])
 
-    def set_eval(self, text):
-        """Remember the latest evaluation text; it is only shown while the Eval box is ticked."""
-        self.eval_text = text
-        self.refresh_eval()
+    # ----- evaluation bar -------------------------------------------------------------
+    def show_eval(self, info):
+        """Show the evaluation of a result (None = nothing known yet): score, bar and depth."""
+        self.eval_info = info
+        self.eval_score.set_text(format_eval_short(info))
+        depth = info.get("depth") if info else None
+        self.eval_depth.set_text(f"Depth: {depth}" if depth is not None else "Depth: --")
+        self.set_bar_target(eval_fraction(info))
 
-    def refresh_eval(self):
-        self.eval_label.set_text(": " + self.eval_text if self.eval_chk.get_active() else "")
+    def clear_eval(self):
+        self.show_eval(None)
+
+    def show_final_eval(self, winner):
+        """The game on the board is over: show the result instead of an evaluation."""
+        self.eval_info = None
+        self.eval_score.set_text({"w": "1-0", "b": "0-1", None: "\u00bd-\u00bd"}[winner])
+        self.eval_depth.set_text("Game over")
+        self.set_bar_target({"w": 1.0, "b": 0.0, None: 0.5}[winner])
+
+    def set_bar_target(self, share):
+        """Slide the bar towards `share` (White's part, 0..1)."""
+        self.bar_target = share
+        if not self.eval_chk.get_active():
+            self.bar_pos = share                 # hidden: nothing to animate
+        elif self.bar_timer is None and abs(self.bar_pos - share) > 0.003:
+            self.bar_timer = GLib.timeout_add(16, self.step_bar)
+        self.eval_bar.queue_draw()
+
+    def step_bar(self):
+        """One animation frame (about 60 per second): the bar covers a fifth of the remaining way."""
+        gap = self.bar_target - self.bar_pos
+        if abs(gap) < 0.003:
+            self.bar_pos = self.bar_target
+            self.bar_timer = None
+            self.eval_bar.queue_draw()
+            return False
+        self.bar_pos += gap * 0.2
+        self.eval_bar.queue_draw()
+        return True
+
+    def on_draw_eval(self, widget, cr):
+        alloc = widget.get_allocation()
+        draw_eval_bar(cr, alloc.width, alloc.height, self.bar_pos)
+        return False
+
+    # ----- view toggles, spin boxes and saved settings -----------------------------------
+    @staticmethod
+    def add_toggle(row, text, tooltip):
+        """"Text [ ]" -- the label first, then its check box.  Returns the check box."""
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        box.pack_start(Gtk.Label(label=text), False, False, 0)
+        chk = Gtk.CheckButton()
+        chk.set_tooltip_text(tooltip)
+        box.pack_start(chk, False, False, 0)
+        row.pack_start(box, False, False, 0)
+        return chk
+
+    @staticmethod
+    def pack_spin_row(box, text, spin):
+        """"Label [spin]" as one line of a vertical box; the spin boxes line up."""
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        label = Gtk.Label(label=text)
+        label.set_width_chars(8)
+        label.set_xalign(1)
+        spin.set_width_chars(3)
+        row.pack_start(label, False, False, 0)
+        row.pack_start(spin, False, False, 0)
+        row.show_all()
+        box.pack_start(row, False, False, 0)
+
+    def grow_window(self, dw=0, dh=0):
+        """Make the window dw / dh pixels bigger (smaller if negative); growing stops at the screen size."""
+        width, height = self.get_size()
+        new_w, new_h = width + dw, height + dh
+        try:
+            screen = Gdk.Screen.get_default()
+            if screen is not None:
+                if dw > 0:
+                    new_w = max(width, min(new_w, screen.get_width() - 40))
+                if dh > 0:
+                    new_h = max(height, min(new_h, screen.get_height() - 80))
+        except Exception:
+            pass
+        self.resize(max(1, new_w), max(1, new_h))
+
+    def on_eval_toggled(self, chk):
+        if chk.get_active():
+            self.eval_box.show()
+            self.bar_pos = self.bar_target       # no sliding from wherever it was while hidden
+            self.eval_bar.queue_draw()
+        else:
+            self.eval_box.hide()
+        self.save_prefs()
+
+    def on_lines_toggled(self, chk):
+        show = chk.get_active()
+        if show == self.lines_shown:
+            return
+        self.lines_shown = show
+        self.analyzer.want_text = show           # the notation is only worked out while it is visible
+        if show:
+            self.lines_row.show()
+            self.lines_delta = LINES_BOX_HEIGHT + 8
+            if not self.loading_prefs:           # keep the board the same size
+                self.grow_window(dh=self.lines_delta)
+            self.analyzer.nudge()
+        else:
+            self.lines_row.hide()
+            self.grow_window(dh=-self.lines_delta)
+            self.lines_delta = 0
+        self.refresh_lines_panel()
+        self.save_prefs()
+
+    def on_suggestion_toggled(self, chk):
+        self.area.queue_draw()
+        self.save_prefs()
+
+    def on_analysis_setting_changed(self, _spin):
+        """Lines or Threads changed: the only settings that make the analysis start again."""
+        self.save_prefs()
+        if not self.loading_prefs:
+            self.update_analysis()
+
+    def current_prefs(self):
+        return {
+            "piece_set": self.piece_set_name,
+            "show_eval": self.eval_chk.get_active(),
+            "show_lines": self.lines_chk.get_active(),
+            "show_suggestion": self.best_chk.get_active(),
+            "show_move_list": self.move_chk.get_active(),
+            "lines": int(self.lines_spin.get_value()),
+            "threads": int(self.threads_spin.get_value()),
+        }
+
+    def save_prefs(self):
+        if not self.loading_prefs:
+            save_settings(self.current_prefs(), self.prefs_path)
 
     @staticmethod
     def pack_spin_right(row, text, spin):
@@ -1556,7 +1992,8 @@ class DragonangaWindow(Gtk.Window):
     def on_destroy(self, *_):
         try:
             self.cancel_engine_move()
-            self.cancel_analysis()
+            self.save_prefs()
+            self.analyzer.close()
             self.engine.close()
             self.oracle.close()
         finally:
@@ -1588,7 +2025,6 @@ class DragonangaWindow(Gtk.Window):
     def new_game(self):
         """Back to the starting position; the mode and board orientation stay as they are."""
         self.cancel_engine_move()
-        self.cancel_analysis()
         self.start_fen, self.start_stm = None, "w"
         self.tree = GameTree(None)
         self.current = self.tree.root
@@ -1596,7 +2032,8 @@ class DragonangaWindow(Gtk.Window):
         self.last_move = None
         self.notes.clear()
         self.engine.new_game()
-        self.set_eval("+0.00 | Starting position")
+        self.analysis_fresh = True
+        self.clear_eval()
         self.sync_board()
         self.maybe_engine_move()
 
@@ -1703,16 +2140,17 @@ class DragonangaWindow(Gtk.Window):
         return grid
 
     def sync_board(self):
-        self.cancel_analysis()  # the engine must be idle before we query it
         self.fen, self.legal_moves, self.in_check = self.engine.get_state(self.moves, self.start_fen)
         turn = "White" if self.turn_color() == "w" else "Black"
         mode = MODES[self.mode][1]
         self.btn_undo.set_sensitive(undo_length(self.start_stm, self.current.ply, self.human_sides) is not None)
         self.btn_redo.set_sensitive(self.tree.redo_child(self.current) is not None)
+        self.final_outcome = None
         if not self.legal_moves:
             prev_fen = None
             if self.moves:  # position before the last move, to tell a baremate from a stalemate
                 prev_fen = self.engine.get_state(self.moves[:-1], self.start_fen, quiet=True)[0]
+            self.final_outcome = game_outcome(self.fen, self.in_check, prev_fen)
             self.status_label.set_text(game_over_text(self.fen, self.in_check, prev_fen))
         else:
             chk = " (IN CHECK!)" if self.in_check else ""
@@ -1720,9 +2158,9 @@ class DragonangaWindow(Gtk.Window):
                 f"Mode: {mode} | Move: {turn}{chk} | Legal moves: {len(self.legal_moves)} | "
                 f"FEN: {engine_fen_to_designer(self.fen)}"
             )
+        self.update_analysis()
         self.area.queue_draw()
         self.refresh_move_list()
-        self.maybe_start_analysis()
 
     # ----- importing a position ------------------------------------------------
     def check_start_position(self, engine_fen):
@@ -1748,7 +2186,6 @@ class DragonangaWindow(Gtk.Window):
         self.check_start_position(engine_fen)
 
         self.cancel_engine_move()
-        self.cancel_analysis()
         self.start_fen, self.start_stm = engine_fen, engine_fen.split()[1]
         self.tree = GameTree(engine_fen)
         self.current = self.tree.root
@@ -1756,7 +2193,8 @@ class DragonangaWindow(Gtk.Window):
         self.last_move = None
         self.notes.clear()
         self.engine.new_game()
-        self.set_eval(f"-- | Position imported ({used} letters)")
+        self.analysis_fresh = True
+        self.clear_eval()
         self.sync_board()
         self.maybe_engine_move()
         return used
@@ -1828,7 +2266,6 @@ class DragonangaWindow(Gtk.Window):
         if tree.start_fen:
             self.check_start_position(tree.start_fen)
         self.cancel_engine_move()
-        self.cancel_analysis()
         self.start_fen, self.start_stm = tree.start_fen, tree.start_stm
         self.tree = tree
         self.current = tree.main_end()               # show the end of the main line
@@ -1837,7 +2274,8 @@ class DragonangaWindow(Gtk.Window):
         self.last_move = self.current.move
         self.notes.clear()
         self.engine.new_game()
-        self.set_eval("-- | PGN imported")
+        self.analysis_fresh = True
+        self.clear_eval()
         self.sync_board()
         self.maybe_engine_move()
 
@@ -1948,14 +2386,6 @@ class DragonangaWindow(Gtk.Window):
             return
         self.trigger_engine_move()
 
-    def make_pump(self, cancel, publish, max_lines):
-        pump = InfoPump(
-            self.converter, self.start_fen, list(self.moves), self.turn_color(),
-            self.fullmove_number(), cancel, publish, max_lines,
-        )
-        pump.start()
-        return pump
-
     def trigger_engine_move(self):
         self.thinking = True
         self.engine_gen += 1
@@ -1966,15 +2396,13 @@ class DragonangaWindow(Gtk.Window):
         skill, depth, movetime_ms = strength_settings(
             self.strength_spin.get_value(), int(self.time_spin.get_value() * 1000))
         moves, start_fen = list(self.moves), self.start_fen
-        pump = self.make_pump(cancel, lambda res: GLib.idle_add(self.on_engine_info, gen, res), 1)
 
         def worker():
-            best = None
             try:
-                best = self.engine.search(moves, movetime_ms, pump.feed, cancel=cancel, start_fen=start_fen,
-                                          skill=skill, depth=depth)
-            finally:
-                pump.close()
+                best = self.engine.search(moves, movetime_ms, lambda line: None, cancel=cancel,
+                                          start_fen=start_fen, skill=skill, depth=depth)
+            except (OSError, ValueError):
+                return                    # the engine process is gone (the window is closing)
             GLib.idle_add(self.finish_engine_move, gen, best)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1988,11 +2416,6 @@ class DragonangaWindow(Gtk.Window):
             self.engine_cancel = None
             self.thinking = False
 
-    def on_engine_info(self, gen, results):
-        if gen == self.engine_gen and self.thinking and results:
-            self.set_eval(format_eval(results[0]))
-        return False
-
     def finish_engine_move(self, gen, bestmove):
         if gen != self.engine_gen:
             return False
@@ -2004,73 +2427,61 @@ class DragonangaWindow(Gtk.Window):
         self.maybe_engine_move()
         return False
 
-    # ----- background analysis (best-move arrow, engine lines) -----------------------
-    def cancel_analysis(self):
-        self.analysis_gen += 1  # late results from the old search are ignored
-        if self.analysis_cancel is not None:
-            self.engine.request_stop(self.analysis_cancel)
-            self.analysis_cancel = None
-        self.best_move = None
-        self.analysis_lines = []
-
-    def maybe_start_analysis(self):
-        want_lines = self.lines_chk.get_active()
-        if (
-            not (want_lines or self.best_chk.get_active())
-            or self.thinking
-            or not self.legal_moves
-            or not self.is_human_turn()
-        ):
-            self.refresh_lines_panel()
-            return
-        cancel = threading.Event()
-        self.analysis_cancel = cancel
-        gen = self.analysis_gen
-        moves, start_fen = list(self.moves), self.start_fen
-        n_lines = NUM_LINES if want_lines else 1
-        pump = self.make_pump(cancel, lambda res: GLib.idle_add(self.on_analysis_lines, gen, res), n_lines)
-
-        def worker():
-            try:
-                self.engine.search(moves, None, pump.feed, cancel=cancel, multipv=n_lines, start_fen=start_fen)
-            finally:
-                pump.close()
-
-        threading.Thread(target=worker, daemon=True).start()
+    # ----- always-on analysis (evaluation, Suggestion arrow, Lines) --------------------------
+    def update_analysis(self):
+        """Aim the analysis at the position on the board.  If it is already analysing exactly this
+        position (a view toggle, a change of side or mode...), nothing is restarted."""
+        if not self.legal_moves:                      # game over
+            self.analyzer.stop()
+            self.best_move, self.analysis_lines = None, []
+            outcome = self.final_outcome
+            self.show_final_eval(outcome[1] if outcome else None)
+        else:
+            restarted = self.analyzer.analyse(
+                self.start_fen, list(self.moves), self.turn_color(), self.fullmove_number(),
+                int(self.lines_spin.get_value()), int(self.threads_spin.get_value()), fresh=self.analysis_fresh)
+            self.analysis_fresh = False
+            if restarted:                             # the old arrow and lines belong to the old position
+                self.best_move, self.analysis_lines = None, []
         self.refresh_lines_panel()
 
     def on_analysis_lines(self, gen, results):
-        if gen != self.analysis_gen or not results:
-            return False
+        if gen != self.analyzer.gen or not results:
+            return False                              # a result of a position we have left
         self.analysis_lines = results
         top = results[0]
+        previous = self.best_move
         self.best_move = top["pv"][0] if top["pv"] else None
-        self.set_eval(format_eval(top))
+        self.show_eval(top)
         self.refresh_lines_panel()
-        self.area.queue_draw()
+        if self.best_chk.get_active() and self.best_move != previous:
+            self.area.queue_draw()
         return False
 
-    def on_analysis_option_toggled(self, _):
-        if self.lines_chk.get_active():
-            self.lines_box.show()
-        else:
-            self.lines_box.hide()
-        self.cancel_analysis()
-        self.maybe_start_analysis()
-        self.area.queue_draw()
-
     def refresh_lines_panel(self):
-        rows = [""] * NUM_LINES
+        """Fill the Lines box (the labels are only rewritten, the box never changes size)."""
+        shown = int(self.lines_spin.get_value())
+        rows = [""] * MAX_LINES
         if self.lines_chk.get_active():
-            if self.analysis_lines:
-                for i, info in enumerate(self.analysis_lines[:NUM_LINES]):
-                    rows[i] = format_line_row(info)
-            elif self.analysis_cancel is not None:
-                rows[0] = "Analysing…"
-            elif self.legal_moves and not self.is_human_turn():
+            if not self.legal_moves:
+                pass
+            elif not self.is_human_turn():
                 rows[0] = "(lines are shown on your turn)"
-        for lbl, text in zip(self.line_labels, rows):
-            lbl.set_markup(f"<tt>{html.escape(text)}</tt>")
+            elif self.analysis_lines:
+                for i, info in enumerate(self.analysis_lines[:shown]):
+                    rows[i] = format_line_row(info)
+            else:
+                rows[0] = "Analysing\u2026"
+        if (shown, rows) == self.line_cache:
+            return                                    # nothing to change (this runs several times a second)
+        self.line_cache = (shown, rows)
+        for i, lbl in enumerate(self.line_labels):
+            if i < shown:
+                lbl.show()
+            else:
+                lbl.hide()
+            lbl.set_markup(f"<tt>{html.escape(rows[i])}</tt>")
+            lbl.set_tooltip_text(rows[i] or None)
 
     # ----- mouse -------------------------------------------------------------
     def event_to_sq(self, x, y):
@@ -2168,7 +2579,8 @@ class DragonangaWindow(Gtk.Window):
 
         draw_board(
             cr, size, self.parse_fen_grid(), self.flipped, self.selected_sq, targets,
-            self.last_move, self.notes, self.best_move if self.best_chk.get_active() else None,
+            self.last_move, self.notes,
+            self.best_move if self.best_chk.get_active() and self.legal_moves and self.is_human_turn() else None,
             self.piece_images,
         )
 
