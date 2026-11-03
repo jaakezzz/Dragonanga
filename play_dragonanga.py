@@ -30,8 +30,17 @@ Analysis (a second engine analyses the position on the board all the time, in ev
   The three boxes only show or hide things; they never restart the engine's calculation. It only
   starts again when the position changes, or when you change Lines or Threads.
 
+Visual Settings (button at the right end of the Eval line; everything changes at once)
+  * Pieces            Simple tokens (built in) or any picture set found in the pieces/ folder,
+                      with a Dragon beside the list as a preview
+  * Board colors      Classic (wood), Green (chess.com), Blue (Lichess) or Custom: two swatches open
+                      a colour picker (click or drag, RGB boxes, hex code); a 4-square preview
+  * Engine lines      Top (above the Eval line) or Bottom (at the bottom of the window)
+  * Light / Dark      the sliding sun / moon switch; it themes every window of the app
+
 Settings (settings.json in your user folder; delete it to start again with the defaults)
-  Remembered: piece set, Eval / Lines / Suggestion / Move List, number of lines and threads.
+  Remembered: piece set, board colors, Light / Dark mode, where the engine lines go,
+  Eval / Lines / Suggestion / Move List, number of lines and threads.
   Windows %APPDATA%\\Dragonanga, Linux ~/.config/Dragonanga (or $DRAGONANGA_CONFIG for any file).
   The game itself is never saved: the app always starts a new game.
 
@@ -42,10 +51,9 @@ Move list
   * Undo Move / Redo Move   step back / forward (against the engine: your move and its reply)
   * Import PGN / Export PGN   below the list; variations are kept
 
-Pieces
-  * Pieces: drop-down   Simple tokens (built in) or any picture set found in the pieces/ folder,
-                        e.g. pieces/Handmade/white-soldier.png ... black-minister.png
-                        (python play_dragonanga.py --check-pieces tells you what was found)
+Pieces (chosen in Visual Settings)
+  * Picture sets go in the pieces/ folder, e.g. pieces/Handmade/white-soldier.png ... black-minister.png
+    (python play_dragonanga.py --check-pieces tells you what was found)
 
 Drawing
   * Right click + drag   arrow (Shift red, Ctrl orange, Alt purple); right click a square = circle
@@ -53,6 +61,7 @@ Drawing
 """
 import bisect
 import collections
+import colorsys
 import datetime
 import html
 import json
@@ -275,7 +284,201 @@ def format_line_row(info):
     return f"{info['score']:>7}  d{depth:<3} {info.get('text', '')}"
 
 
+# ----- colours: board colour schemes and the Light / Dark themes ----------------------------------------
+HEX_COLOUR = re.compile(r"^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+
+def parse_hex_colour(text):
+    """'#RRGGBB' -> (r, g, b) as 0-255 ints, or None.  The '#' and the case are optional, '#abc' works too."""
+    match = HEX_COLOUR.match(text.strip()) if isinstance(text, str) else None
+    if not match:
+        return None
+    digits = match.group(1)
+    if len(digits) == 3:
+        digits = "".join(ch * 2 for ch in digits)
+    return int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16)
+
+
+def to_hex(rgb):
+    """(r, g, b) as 0-255 -> '#RRGGBB'."""
+    return "#%02X%02X%02X" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
+
+
+def hex_to_unit(text):
+    """'#RRGGBB' -> (r, g, b) as 0..1, the way cairo wants them."""
+    r, g, b = parse_hex_colour(text)
+    return r / 255.0, g / 255.0, b / 255.0
+
+
+def rgb_to_hsv(rgb):
+    """(r, g, b) 0-255 -> (hue, saturation, value), each 0..1."""
+    return colorsys.rgb_to_hsv(rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0)
+
+
+def hsv_to_rgb(h, s, v):
+    """(hue, saturation, value) 0..1 -> (r, g, b) as 0-255 ints."""
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return int(round(r * 255)), int(round(g * 255)), int(round(b * 255))
+
+
+def relative_luminance(rgb):
+    """How bright a colour looks (0 black .. 1 white); rgb is 0..1."""
+    def lin(c):
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+
+
+def contrast_ratio(a, b):
+    la, lb = relative_luminance(a), relative_luminance(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+# Board colour schemes: key -> (name, light square, dark square).
+#   classic  the wood colours the board always had
+#   green    the chess.com board (light #EBECD0, dark #739552)
+#   blue     the Lichess "blue" board (light #DEE3E6, dark #8CA2AD)
+BOARD_SCHEMES = {
+    "classic": ("Classic", "#EDD9B5", "#B58763"),
+    "green": ("Green", "#EBECD0", "#739552"),
+    "blue": ("Blue", "#DEE3E6", "#8CA2AD"),
+}
+CUSTOM = "custom"
+SCHEME_CHOICES = [(key, entry[0]) for key, entry in BOARD_SCHEMES.items()] + [(CUSTOM, "Custom")]
+DEFAULT_BOARD_SCHEME = "classic"
+
+
+def scheme_hexes(scheme, custom_light=None, custom_dark=None):
+    """(light square, dark square) as '#RRGGBB' for a scheme; Custom uses the two given colours."""
+    if scheme == CUSTOM:
+        return (custom_light or BOARD_SCHEMES[DEFAULT_BOARD_SCHEME][1],
+                custom_dark or BOARD_SCHEMES[DEFAULT_BOARD_SCHEME][2])
+    entry = BOARD_SCHEMES.get(scheme) or BOARD_SCHEMES[DEFAULT_BOARD_SCHEME]
+    return entry[1], entry[2]
+
+
+def board_colours(scheme, custom_light=None, custom_dark=None):
+    """Everything draw_board needs to know about colour (r, g, b as 0..1, alphas where see-through):
+    the two squares, the mark on the last move, the selected square, the legal-move dots and the
+    coordinate letters.  The marks are drawn over the square, so they work on any colours."""
+    light_hex, dark_hex = scheme_hexes(scheme, custom_light, custom_dark)
+    light, dark = hex_to_unit(light_hex), hex_to_unit(dark_hex)
+
+    def letters(square, other):          # the other square's colour, unless that is too faint to read
+        if contrast_ratio(square, other) >= 2.0:
+            return other
+        return (0.12, 0.12, 0.12) if relative_luminance(square) > 0.35 else (0.94, 0.94, 0.94)
+
+    if scheme in ("classic", "blue"):    # the Lichess look: a green-yellow wash, green dots
+        mark = (155 / 255.0, 199 / 255.0, 0.0, 0.41)
+        dot = (0.15, 0.65, 0.25, 0.75)
+    else:                                # the chess.com look: a yellow wash, grey dots
+        mark = (1.0, 1.0, 0.2, 0.5)
+        dot = (0.0, 0.0, 0.0, 0.30) if relative_luminance(dark) > 0.2 else (1.0, 1.0, 1.0, 0.40)
+    return {
+        "light": light, "dark": dark,
+        "mark": mark, "select": (0.98, 0.82, 0.10, 0.70), "dot": dot,
+        "letters_on_light": letters(light, dark), "letters_on_dark": letters(dark, light),
+    }
+
+
+CLASSIC_COLOURS = board_colours(DEFAULT_BOARD_SCHEME)
+
+# Light and Dark mode.  "surface" is the colour of the boxes you read from: the move list, the
+# engine Lines box, and (in Light mode) the white part of the evaluation bar.
+LIGHT_SURFACE = "#FFFFFF"
+THEMES = {
+    "light": {
+        "surface": LIGHT_SURFACE, "text": "#2E3436",
+        "bar_white": hex_to_unit(LIGHT_SURFACE), "bar_dark": (0.18, 0.18, 0.18),
+        "bar_edge": (0.45, 0.45, 0.45), "bar_mark": (0.5, 0.5, 0.5, 0.9),
+        "muted": "#7A7A7A", "current_bg": "#FFE082", "current_fg": "#000000",
+    },
+    "dark": {
+        "surface": "#262626", "text": "#EEEEEC",
+        "bar_white": (0.92, 0.92, 0.92), "bar_dark": (0.07, 0.07, 0.07),
+        "bar_edge": (0.42, 0.42, 0.42), "bar_mark": (0.5, 0.5, 0.5, 0.9),
+        "muted": "#9A9A9A", "current_bg": "#8A6A00", "current_fg": "#FFFFFF",
+    },
+}
+DEFAULT_THEME = "light"
+
+
+def theme_css(theme):
+    """The style sheet that goes on top of GTK's own theme: the reading boxes get the surface colour."""
+    return (
+        ".dragon-surface, .dragon-surface viewport, .dragon-surface text "
+        f"{{ background-color: {theme['surface']}; color: {theme['text']}; }}\n"
+        "button.compact { padding: 0px 8px; min-height: 0px; min-width: 0px; }\n"
+    ).encode()
+
+
+_theme_provider = None
+_dark_titlebars = False
+
+
+def apply_gtk_theme(name):
+    """Switch the whole app (every window and dialog) to Light or Dark mode and return the theme.
+    GTK's built-in Adwaita theme is used on every system, because it has a dark variant."""
+    global _theme_provider, _dark_titlebars
+    theme = THEMES.get(name) or THEMES[DEFAULT_THEME]
+    _dark_titlebars = theme is THEMES["dark"]
+    try:
+        settings = Gtk.Settings.get_default()
+        if settings is not None:
+            settings.set_property("gtk-theme-name", "Adwaita")
+            settings.set_property("gtk-application-prefer-dark-theme", _dark_titlebars)
+    except Exception:
+        pass
+    try:
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            if _theme_provider is None:
+                _theme_provider = Gtk.CssProvider()
+                Gtk.StyleContext.add_provider_for_screen(
+                    screen, _theme_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            _theme_provider.load_from_data(theme_css(theme))
+    except Exception:
+        pass            # cosmetic: without the style sheet the boxes simply keep the theme's own colours
+    return theme
+
+
+def set_titlebar_dark(window):
+    """Windows draws the title bar itself, so GTK's theme does not reach it: ask Windows for a dark
+    one (or a light one) to match.  Does nothing on other systems, or if anything is missing."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        gdk_window = window.get_window()
+        if gdk_window is None:
+            return
+        get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
+        get_pointer.restype = ctypes.c_void_p
+        get_pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        gdk = ctypes.CDLL("libgdk-3-0.dll")
+        gdk.gdk_win32_window_get_handle.restype = ctypes.c_void_p
+        gdk.gdk_win32_window_get_handle.argtypes = [ctypes.c_void_p]
+        hwnd = gdk.gdk_win32_window_get_handle(get_pointer(gdk_window.__gpointer__, None))
+        if not hwnd:
+            return
+        value = ctypes.c_int(1 if _dark_titlebars else 0)
+        for attribute in (20, 19):       # DWMWA_USE_IMMERSIVE_DARK_MODE (19 before Windows 10 20H1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd), attribute, ctypes.byref(value), ctypes.sizeof(value))
+    except Exception:
+        pass
+
+
+def watch_titlebar(window):
+    """Give a window the right title bar each time it appears (Windows only)."""
+    if os.name == "nt":
+        window.connect("map", lambda *_: set_titlebar_dark(window))
+
+
 # ----- settings file ---------------------------------------------------------
+LINES_POSITIONS = ("top", "bottom")
+DEFAULT_LINES_POSITION = "top"
+
 SETTINGS_DEFAULTS = {
     "piece_set": None,          # name of the piece set (None = the default one)
     "show_eval": True,
@@ -284,6 +487,11 @@ SETTINGS_DEFAULTS = {
     "show_move_list": False,
     "lines": DEFAULT_LINES,
     "threads": DEFAULT_THREADS,
+    "board_scheme": DEFAULT_BOARD_SCHEME,
+    "custom_light": None,       # '#RRGGBB' of the Custom board, None = not chosen yet
+    "custom_dark": None,
+    "lines_position": DEFAULT_LINES_POSITION,
+    "theme": DEFAULT_THEME,
 }
 
 
@@ -322,6 +530,14 @@ def sanitize_settings(raw):
     if isinstance(raw.get("piece_set"), str):
         out["piece_set"] = raw["piece_set"]
     out["threads"] = min(out["threads"], max_threads())
+    schemes = [key for key, _name in SCHEME_CHOICES]
+    for key, allowed in (("board_scheme", schemes), ("lines_position", LINES_POSITIONS), ("theme", list(THEMES))):
+        value = raw.get(key)
+        if isinstance(value, str) and value in allowed:     # (a list or number in the file must not crash this)
+            out[key] = value
+    for key in ("custom_light", "custom_dark"):
+        rgb = parse_hex_colour(raw.get(key))
+        out[key] = to_hex(rgb) if rgb else None
     return out
 
 
@@ -967,7 +1183,62 @@ def draw_circle(cr, sq, name, flipped, rgb, alpha=0.8):
     cr.stroke()
 
 
-def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, best_move, images=None):
+def draw_piece(cr, piece, x, y, sq, images=None):
+    """Draw one piece (engine letter, upper case = White) in the square whose top-left corner is (x, y):
+    a picture from the chosen set, or the built-in token."""
+    picture = images.get(piece, sq * PIECE_IMAGE_SCALE) if (piece and images) else None
+    if picture is not None:
+        side = picture.get_width()
+        cr.set_source_surface(picture, x + (sq - side) / 2.0, y + (sq - side) / 2.0)
+        cr.paint()
+    elif piece:
+        is_white = piece.isupper()
+        cx, cy = x + sq / 2.0, y + sq / 2.0
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+
+        if is_white:
+            cr.set_source_rgb(0.98, 0.98, 0.96)
+        else:
+            cr.set_source_rgb(0.16, 0.16, 0.18)
+        cr.new_sub_path()
+        cr.arc(cx, cy, sq * 0.39, 0, 6.283)
+        cr.fill_preserve()
+
+        cr.set_line_width(2.2)
+        if is_white:
+            cr.set_source_rgb(0.20, 0.20, 0.20)
+        else:
+            cr.set_source_rgb(0.85, 0.85, 0.85)
+        cr.stroke()
+
+        sym, pname = display_piece(piece)
+
+        # Big piece symbol
+        cr.set_font_size(sq * 0.38)
+        ext = cr.text_extents(sym)
+        if is_white:
+            cr.set_source_rgb(0.10, 0.10, 0.10)
+        else:
+            cr.set_source_rgb(0.96, 0.96, 0.96)
+        cr.move_to(cx - ext.width / 2 - ext.x_bearing, cy - ext.height / 2 - ext.y_bearing - sq * 0.06)
+        cr.show_text(sym)
+
+        # Name underneath, shrunk if needed so it stays inside the disc
+        font = sq * 0.13
+        cr.set_font_size(font)
+        sext = cr.text_extents(pname)
+        max_w = sq * 0.60
+        if sext.width > max_w:
+            font *= max_w / sext.width
+            cr.set_font_size(font)
+            sext = cr.text_extents(pname)
+        cr.move_to(cx - sext.width / 2 - sext.x_bearing, cy + sq * 0.23)
+        cr.show_text(pname)
+
+
+def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, best_move, images=None,
+               colours=None):
+    colours = colours or CLASSIC_COLOURS
     sq = size / 8.0
     cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
 
@@ -976,83 +1247,36 @@ def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, 
             name = screen_to_sq(r, c, flipped)
             br, bc = (7 - r, 7 - c) if flipped else (r, c)  # index into the FEN grid
             light = (r + c) % 2 == 0
-            if name == selected_sq:
-                cr.set_source_rgb(0.95, 0.85, 0.30)
-            elif last_move and name in (last_move[:2], last_move[2:4]):
-                cr.set_source_rgb(0.78, 0.86, 0.45) if light else cr.set_source_rgb(0.65, 0.75, 0.32)
-            else:
-                cr.set_source_rgb(0.93, 0.85, 0.71) if light else cr.set_source_rgb(0.71, 0.53, 0.39)
-
+            cr.set_source_rgb(*(colours["light"] if light else colours["dark"]))
             cr.rectangle(c * sq, r * sq, sq, sq)
             cr.fill()
+            if name == selected_sq:                          # a wash over the square: works on any colours
+                cr.set_source_rgba(*colours["select"])
+            elif last_move and name in (last_move[:2], last_move[2:4]):
+                cr.set_source_rgba(*colours["mark"])
+            if name == selected_sq or (last_move and name in (last_move[:2], last_move[2:4])):
+                cr.rectangle(c * sq, r * sq, sq, sq)
+                cr.fill()
 
             # Legal move target dot
             if name in targets:
-                cr.set_source_rgba(0.15, 0.65, 0.25, 0.75)
+                cr.set_source_rgba(*colours["dot"])
                 cr.arc((c + 0.5) * sq, (r + 0.5) * sq, sq * 0.18, 0, 6.283)
                 cr.fill()
 
             # Coordinate labels (follow the board orientation)
+            cr.set_source_rgb(*colours["letters_on_light" if light else "letters_on_dark"])
             if c == 0:
-                cr.set_source_rgb(0.25, 0.25, 0.25)
                 cr.set_font_size(sq * 0.16)
                 cr.move_to(c * sq + 3, r * sq + sq * 0.20)
                 cr.show_text(name[1])
             if r == 7:
-                cr.set_source_rgb(0.25, 0.25, 0.25)
                 cr.set_font_size(sq * 0.16)
                 cr.move_to((c + 1) * sq - sq * 0.20, (r + 1) * sq - 4)
                 cr.show_text(name[0])
 
             # Piece: a picture from the chosen set, or the built-in token
-            piece = grid[br][bc]
-            picture = images.get(piece, sq * PIECE_IMAGE_SCALE) if (piece and images) else None
-            if picture is not None:
-                side = picture.get_width()
-                cr.set_source_surface(picture, c * sq + (sq - side) / 2.0, r * sq + (sq - side) / 2.0)
-                cr.paint()
-            elif piece:
-                is_white = piece.isupper()
-                cx, cy = (c + 0.5) * sq, (r + 0.5) * sq
-
-                if is_white:
-                    cr.set_source_rgb(0.98, 0.98, 0.96)
-                else:
-                    cr.set_source_rgb(0.16, 0.16, 0.18)
-                cr.new_sub_path()
-                cr.arc(cx, cy, sq * 0.39, 0, 6.283)
-                cr.fill_preserve()
-
-                cr.set_line_width(2.2)
-                if is_white:
-                    cr.set_source_rgb(0.20, 0.20, 0.20)
-                else:
-                    cr.set_source_rgb(0.85, 0.85, 0.85)
-                cr.stroke()
-
-                sym, pname = display_piece(piece)
-
-                # Big piece symbol
-                cr.set_font_size(sq * 0.38)
-                ext = cr.text_extents(sym)
-                if is_white:
-                    cr.set_source_rgb(0.10, 0.10, 0.10)
-                else:
-                    cr.set_source_rgb(0.96, 0.96, 0.96)
-                cr.move_to(cx - ext.width / 2 - ext.x_bearing, cy - ext.height / 2 - ext.y_bearing - sq * 0.06)
-                cr.show_text(sym)
-
-                # Name underneath, shrunk if needed so it stays inside the disc
-                font = sq * 0.13
-                cr.set_font_size(font)
-                sext = cr.text_extents(pname)
-                max_w = sq * 0.60
-                if sext.width > max_w:
-                    font *= max_w / sext.width
-                    cr.set_font_size(font)
-                    sext = cr.text_extents(pname)
-                cr.move_to(cx - sext.width / 2 - sext.x_bearing, cy + sq * 0.23)
-                cr.show_text(pname)
+            draw_piece(cr, grid[br][bc], c * sq, r * sq, sq, images)
 
     # Overlays: circles, user arrows, engine best move, live preview while dragging
     for name, brush in notes.circles:
@@ -1072,8 +1296,9 @@ def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, 
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
-def draw_eval_bar(cr, width, height, white_share):
+def draw_eval_bar(cr, width, height, white_share, theme=None):
     """The evaluation bar: White's share is the light part on the left, Black's the dark part."""
+    theme = theme or THEMES[DEFAULT_THEME]
     r = min(height / 2.0, 8.0)
     x, y, w, h = 0.5, 0.5, width - 1.0, height - 1.0
 
@@ -1088,19 +1313,175 @@ def draw_eval_bar(cr, width, height, white_share):
     cr.save()
     outline()
     cr.clip()
-    cr.set_source_rgb(0.18, 0.18, 0.18)
+    cr.set_source_rgb(*theme["bar_dark"])
     cr.paint()
-    cr.set_source_rgb(0.96, 0.96, 0.96)
+    cr.set_source_rgb(*theme["bar_white"])
     cr.rectangle(0, 0, width * max(0.0, min(1.0, white_share)), height)
     cr.fill()
-    cr.set_source_rgba(0.5, 0.5, 0.5, 0.9)           # thin mark at 0.00
+    cr.set_source_rgba(*theme["bar_mark"])           # thin mark at 0.00
     cr.rectangle(width / 2.0 - 0.5, 0, 1, height)
     cr.fill()
     cr.restore()
     outline()
-    cr.set_source_rgb(0.45, 0.45, 0.45)
+    cr.set_source_rgb(*theme["bar_edge"])
     cr.set_line_width(1)
     cr.stroke()
+
+
+# ----- small pictures used by the Visual Settings window ------------------------------------------
+def rounded_rect(cr, x, y, w, h, r):
+    r = max(0.0, min(r, w / 2.0, h / 2.0))
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def draw_swatch(cr, width, height, rgb):
+    """A colour box with a thin edge (rgb 0..1); the clickable boxes of the Custom board colours."""
+    rounded_rect(cr, 0.5, 0.5, width - 1, height - 1, 4)
+    cr.set_source_rgb(*rgb)
+    cr.fill_preserve()
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.45)
+    cr.set_line_width(1)
+    cr.stroke()
+
+
+def draw_checker(cr, size, light, dark):
+    """Four squares, light and dark like the corner of a board: the board colour preview."""
+    half = size / 2.0
+    for row in range(2):
+        for col in range(2):
+            cr.set_source_rgb(*(light if (row + col) % 2 == 0 else dark))
+            cr.rectangle(col * half, row * half, half, half)
+            cr.fill()
+    rounded_rect(cr, 0.5, 0.5, size - 1, size - 1, 3)
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.45)
+    cr.set_line_width(1)
+    cr.stroke()
+
+
+def draw_piece_preview(cr, size, colours, images=None, piece="D"):
+    """A White Dragon on one dark square of the chosen board colours, drawn with the chosen pieces."""
+    rounded_rect(cr, 0.5, 0.5, size - 1, size - 1, 4)
+    cr.set_source_rgb(*colours["dark"])
+    cr.fill_preserve()
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.45)
+    cr.set_line_width(1)
+    cr.stroke()
+    draw_piece(cr, piece.upper(), 0, 0, size, images)
+
+
+def draw_sv_square(cr, width, height, hue, sat, val):
+    """The colour picker's square: saturation grows to the right, brightness upwards."""
+    cr.set_source_rgb(*colorsys.hsv_to_rgb(hue, 1.0, 1.0))
+    cr.rectangle(0, 0, width, height)
+    cr.fill()
+    across = cairo.LinearGradient(0, 0, width, 0)
+    across.add_color_stop_rgba(0.0, 1, 1, 1, 1)
+    across.add_color_stop_rgba(1.0, 1, 1, 1, 0)
+    cr.set_source(across)
+    cr.rectangle(0, 0, width, height)
+    cr.fill()
+    down = cairo.LinearGradient(0, 0, 0, height)
+    down.add_color_stop_rgba(0.0, 0, 0, 0, 0)
+    down.add_color_stop_rgba(1.0, 0, 0, 0, 1)
+    cr.set_source(down)
+    cr.rectangle(0, 0, width, height)
+    cr.fill()
+    cx, cy = sat * width, (1.0 - val) * height          # the ring that marks the chosen colour
+    cr.set_line_width(3.0)
+    cr.set_source_rgba(0, 0, 0, 0.6)
+    cr.new_sub_path()
+    cr.arc(cx, cy, 6.0, 0, 6.283185307)
+    cr.stroke()
+    cr.set_line_width(1.5)
+    cr.set_source_rgb(1, 1, 1)
+    cr.new_sub_path()
+    cr.arc(cx, cy, 6.0, 0, 6.283185307)
+    cr.stroke()
+
+
+def draw_hue_strip(cr, width, height, hue):
+    """The rainbow bar under the square, with a handle at the chosen hue."""
+    rainbow = cairo.LinearGradient(0, 0, width, 0)
+    for i in range(7):
+        rainbow.add_color_stop_rgb(i / 6.0, *colorsys.hsv_to_rgb(i / 6.0 if i < 6 else 0.0, 1.0, 1.0))
+    cr.set_source(rainbow)
+    cr.rectangle(0, 0, width, height)
+    cr.fill()
+    x = max(2.0, min(width - 2.0, hue * width))
+    cr.set_source_rgba(0, 0, 0, 0.6)
+    cr.rectangle(x - 3.5, 0, 7, height)
+    cr.fill()
+    cr.set_source_rgb(1, 1, 1)
+    cr.rectangle(x - 2, 1, 4, height - 2)
+    cr.fill()
+
+
+def _mix(a, b, t):
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(len(a)))
+
+
+def draw_moon(cr, cx, cy, r, colour, cut_colour):
+    """A crescent: a disc with a second disc in the background colour taken out of it."""
+    cr.set_source_rgb(*colour)
+    cr.new_sub_path()
+    cr.arc(cx, cy, r, 0, 6.283185307)
+    cr.fill()
+    cr.set_source_rgb(*cut_colour)
+    cr.new_sub_path()
+    cr.arc(cx + r * 0.55, cy - r * 0.35, r * 0.82, 0, 6.283185307)
+    cr.fill()
+
+
+def draw_sun(cr, cx, cy, r, colour):
+    cr.set_source_rgb(*colour)
+    cr.new_sub_path()
+    cr.arc(cx, cy, r * 0.55, 0, 6.283185307)
+    cr.fill()
+    cr.set_line_width(max(1.2, r * 0.2))
+    for i in range(8):
+        a = i * math.pi / 4
+        cr.move_to(cx + math.cos(a) * r * 0.8, cy + math.sin(a) * r * 0.8)
+        cr.line_to(cx + math.cos(a) * r * 1.15, cy + math.sin(a) * r * 1.15)
+        cr.stroke()
+
+
+def draw_theme_switch(cr, width, height, pos):
+    """The Light / Dark switch.  pos 0 = Dark (the knob on the moon, left), 1 = Light (the sun, right);
+    values in between are the knob sliding."""
+    night, day = (0.16, 0.20, 0.31), (0.58, 0.80, 0.94)
+    track = _mix(night, day, pos)
+    rounded_rect(cr, 0.5, 0.5, width - 1, height - 1, (height - 1) / 2.0)
+    cr.set_source_rgb(*track)
+    cr.fill_preserve()
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.45)
+    cr.set_line_width(1)
+    cr.stroke()
+
+    margin = height / 2.0
+    left, right = margin, width - margin
+    icon = height * 0.24
+    draw_moon(cr, left, height / 2.0, icon, _mix((0.95, 0.95, 0.85), (0.30, 0.36, 0.52), pos), track)
+    draw_sun(cr, right, height / 2.0, icon, _mix((1.0, 0.85, 0.35), (0.98, 0.62, 0.10), pos))
+
+    knob = _mix((0.88, 0.90, 0.95), (1.0, 1.0, 1.0), pos)
+    kx = left + (right - left) * pos
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.25)                    # a soft shadow
+    cr.new_sub_path()
+    cr.arc(kx, height / 2.0 + 1.0, height * 0.40, 0, 6.283185307)
+    cr.fill()
+    cr.set_source_rgb(*knob)
+    cr.new_sub_path()
+    cr.arc(kx, height / 2.0, height * 0.40, 0, 6.283185307)
+    cr.fill()
+    if pos < 0.5:                                              # the knob carries the mode's picture
+        draw_moon(cr, kx, height / 2.0, icon, (0.16, 0.20, 0.31), knob)
+    else:
+        draw_sun(cr, kx, height / 2.0, icon, (0.98, 0.62, 0.10))
 
 
 class UCIEngine:
@@ -1468,6 +1849,15 @@ class DragonangaWindow(Gtk.Window):
         self.prefs_path = settings_path()
         self.prefs = load_settings(self.prefs_path)
         self.loading_prefs = True              # nothing is saved while the saved values are applied
+        self.theme_name = self.prefs["theme"]
+        self.theme = apply_gtk_theme(self.theme_name)     # before any widget exists, so nothing flashes
+        self.board_scheme = self.prefs["board_scheme"]
+        self.custom_light = self.prefs["custom_light"]    # '#RRGGBB' or None (not chosen yet)
+        self.custom_dark = self.prefs["custom_dark"]
+        self.board_colours = board_colours(self.board_scheme, self.custom_light, self.custom_dark)
+        self.lines_position = self.prefs["lines_position"]
+        self.visual_win = None                 # the Visual Settings window while it is open
+        watch_titlebar(self)
         width, height = WINDOW_SIZE
         if self.prefs["show_lines"]:
             height += LINES_BOX_HEIGHT + 8     # room for the Lines box, so the board keeps its size
@@ -1521,6 +1911,7 @@ class DragonangaWindow(Gtk.Window):
         vbox.set_margin_start(8)
         vbox.set_margin_end(8)
         self.add(vbox)
+        self.main_box = vbox
 
         # Row 1: game and mode
         row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -1572,6 +1963,7 @@ class DragonangaWindow(Gtk.Window):
 
         eval_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         vbox.pack_start(eval_row, False, False, 2)
+        self.eval_row = eval_row
 
         # "+0.3 [=====bar=====] Depth: 18" -- shown while the Eval toggle is ticked
         self.eval_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -1594,7 +1986,7 @@ class DragonangaWindow(Gtk.Window):
         self.eval_box.set_no_show_all(True)
         eval_row.pack_start(self.eval_box, True, True, 0)
 
-        # Right end of the line, right to left: Move List, Redo Move, Undo Move, then the piece style
+        # Right end of the line, right to left: Move List, Redo Move, Undo Move, then Visual Settings
         self.move_chk = Gtk.CheckButton(label="Move List")
         self.move_chk.set_tooltip_text("Show the moves next to the board")
         self.move_chk.connect("toggled", self.on_move_list_toggled)
@@ -1610,19 +2002,14 @@ class DragonangaWindow(Gtk.Window):
         self.make_compact(self.btn_undo)
         eval_row.pack_end(self.btn_undo, False, False, 0)
 
-        # Piece style: only shown when there are picture sets to choose from
-        if self.piece_sets:
-            self.piece_combo = Gtk.ComboBoxText()
-            for name in self.piece_set_names:
-                self.piece_combo.append_text(name)
-            self.piece_combo.set_tooltip_text("Piece style")
-            wanted = self.prefs["piece_set"] or DEFAULT_PIECE_SET
-            start = wanted if wanted in self.piece_set_names else TOKENS
-            self.piece_combo.set_active(self.piece_set_names.index(start))
-            self.piece_combo.connect("changed", self.on_piece_set_changed)
-            eval_row.pack_end(self.piece_combo, False, False, 0)
-            eval_row.pack_end(Gtk.Label(label="Pieces:"), False, False, 0)
-            self.load_piece_set(start)   # no redraw needed yet: the board is not built
+        # Visual Settings: pieces, board colours, where the engine lines go, Light / Dark mode
+        self.btn_visual = Gtk.Button(label="Visual Settings")
+        self.btn_visual.set_tooltip_text("Pieces, board colors, engine lines position, Light / Dark mode")
+        self.btn_visual.connect("clicked", self.on_visual_settings)
+        self.make_compact(self.btn_visual)
+        eval_row.pack_end(self.btn_visual, False, False, 0)
+        wanted = self.prefs["piece_set"] or DEFAULT_PIECE_SET
+        self.load_piece_set(wanted if wanted in self.piece_set_names else TOKENS)  # the board is not built yet
 
         # Engine lines: a box of fixed height (about three lines, more lines scroll) with the number of
         # lines and the number of threads beside it.  Visible while the Lines toggle is ticked.
@@ -1632,7 +2019,9 @@ class DragonangaWindow(Gtk.Window):
         scroll.set_shadow_type(Gtk.ShadowType.IN)
         scroll.set_size_request(-1, LINES_BOX_HEIGHT)
         scroll.set_min_content_height(LINES_BOX_HEIGHT)
+        scroll.get_style_context().add_class("dragon-surface")      # same white as the move list
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        inner.get_style_context().add_class("dragon-surface")
         inner.set_margin_start(6)
         inner.set_margin_top(3)
         inner.set_margin_bottom(3)
@@ -1683,6 +2072,7 @@ class DragonangaWindow(Gtk.Window):
         vbox.pack_start(body, True, True, 0)
         body.pack_start(self.area, True, True, 0)
         self.build_move_panel(body)
+        self.place_lines_row()                   # Top or Bottom, as chosen in Visual Settings
 
         # connect the view toggles and the spin boxes, then apply the saved settings
         self.eval_chk.connect("toggled", self.on_eval_toggled)
@@ -1718,15 +2108,19 @@ class DragonangaWindow(Gtk.Window):
         self.move_view.set_top_margin(4)
         self.move_view.set_bottom_margin(4)
         self.move_view.connect("button-release-event", self.on_move_list_click)
+        self.move_view.get_style_context().add_class("dragon-surface")
         scroll.add(self.move_view)
         self.side.pack_start(scroll, True, True, 0)
 
         buf = self.move_view.get_buffer()
-        buf.create_tag("num", foreground="#7a7a7a")        # move numbers
-        buf.create_tag("paren", foreground="#7a7a7a")      # the brackets around variations
+        self.theme_tags = {                                # the colours of these follow Light / Dark mode
+            "num": buf.create_tag("num"),                  # move numbers
+            "paren": buf.create_tag("paren"),              # the brackets around variations
+            "current": buf.create_tag("current"),          # the move on the board
+        }
+        self.colour_move_tags()
         for level in range(1, MAX_INDENT + 1):             # one indent per variation level
             buf.create_tag(f"indent{level}", left_margin=6 + 14 * level)
-        buf.create_tag("current", background="#ffe082", foreground="#000000")   # the move on the board
         buf.create_mark("curmove", buf.get_start_iter(), True)
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -1821,12 +2215,96 @@ class DragonangaWindow(Gtk.Window):
     def use_piece_set(self, name):
         self.load_piece_set(name)
         self.area.queue_draw()
+        self.refresh_visual_window()
         self.save_prefs()
 
-    def on_piece_set_changed(self, combo):
-        idx = combo.get_active()
-        if 0 <= idx < len(self.piece_set_names):
-            self.use_piece_set(self.piece_set_names[idx])
+    # ----- visual settings: board colours, engine lines position, Light / Dark mode --------------
+    def on_visual_settings(self, _btn):
+        if self.visual_win is not None:
+            self.visual_win.present()
+            return
+        self.visual_win = VisualSettingsWindow(self)
+        self.visual_win.show_all()
+        self.visual_win.after_show()
+
+    def refresh_visual_window(self):
+        if self.visual_win is not None:
+            self.visual_win.refresh_previews()
+
+    def current_scheme_hexes(self):
+        return scheme_hexes(self.board_scheme, self.custom_light, self.custom_dark)
+
+    def update_board_colours(self):
+        self.board_colours = board_colours(self.board_scheme, self.custom_light, self.custom_dark)
+        self.area.queue_draw()
+        self.refresh_visual_window()
+
+    def set_board_scheme(self, scheme):
+        if scheme == self.board_scheme or scheme not in dict(SCHEME_CHOICES):
+            return
+        if scheme == CUSTOM and not (self.custom_light and self.custom_dark):
+            # the first time: Custom starts from the colours that are on the board now
+            self.custom_light, self.custom_dark = self.current_scheme_hexes()
+        self.board_scheme = scheme
+        self.update_board_colours()
+        self.save_prefs()
+
+    def set_custom_colour(self, which, hex_colour, commit=True):
+        """Set the Custom board's 'light' or 'dark' square colour.  commit=False only shows it (while the
+        colour picker is still open); the colour is saved when it is set again with commit=True."""
+        rgb = parse_hex_colour(hex_colour)
+        if rgb is None or which not in ("light", "dark"):
+            return
+        if which == "light":
+            self.custom_light = to_hex(rgb)
+        else:
+            self.custom_dark = to_hex(rgb)
+        self.update_board_colours()
+        if commit:
+            self.save_prefs()
+
+    def place_lines_row(self):
+        """Top: just above the Eval line (so below the status line).  Bottom: the last thing in the window."""
+        box = self.main_box
+        if self.lines_position == "top":
+            children = box.get_children()
+            target = children.index(self.eval_row)
+            if children.index(self.lines_row) < target:
+                target -= 1                      # it is leaving a place before the Eval line
+            box.reorder_child(self.lines_row, target)
+        else:
+            box.reorder_child(self.lines_row, -1)
+
+    def set_lines_position(self, position):
+        if position not in LINES_POSITIONS or position == self.lines_position:
+            return
+        self.lines_position = position
+        self.place_lines_row()
+        self.refresh_visual_window()
+        self.save_prefs()
+
+    def colour_move_tags(self):
+        """Colour the move list's tags for the current Light / Dark mode."""
+        theme = self.theme
+        self.theme_tags["num"].set_property("foreground", theme["muted"])
+        self.theme_tags["paren"].set_property("foreground", theme["muted"])
+        self.theme_tags["current"].set_property("background", theme["current_bg"])
+        self.theme_tags["current"].set_property("foreground", theme["current_fg"])
+
+    def set_theme(self, name):
+        """Switch every window between Light and Dark mode."""
+        if name not in THEMES or name == self.theme_name:
+            return
+        self.theme_name = name
+        self.theme = apply_gtk_theme(name)
+        self.colour_move_tags()
+        self.eval_bar.queue_draw()
+        self.area.queue_draw()
+        for window in (self, self.visual_win):
+            if window is not None and os.name == "nt":
+                set_titlebar_dark(window)
+        self.refresh_visual_window()
+        self.save_prefs()
 
     # ----- evaluation bar -------------------------------------------------------------
     def show_eval(self, info):
@@ -1870,7 +2348,7 @@ class DragonangaWindow(Gtk.Window):
 
     def on_draw_eval(self, widget, cr):
         alloc = widget.get_allocation()
-        draw_eval_bar(cr, alloc.width, alloc.height, self.bar_pos)
+        draw_eval_bar(cr, alloc.width, alloc.height, self.bar_pos, self.theme)
         return False
 
     # ----- view toggles, spin boxes and saved settings -----------------------------------
@@ -1960,6 +2438,11 @@ class DragonangaWindow(Gtk.Window):
             "show_move_list": self.move_chk.get_active(),
             "lines": int(self.lines_spin.get_value()),
             "threads": int(self.threads_spin.get_value()),
+            "board_scheme": self.board_scheme,
+            "custom_light": self.custom_light,
+            "custom_dark": self.custom_dark,
+            "lines_position": self.lines_position,
+            "theme": self.theme_name,
         }
 
     def save_prefs(self):
@@ -2201,6 +2684,7 @@ class DragonangaWindow(Gtk.Window):
 
     def on_import(self, _):
         dialog = Gtk.Dialog(title="Import Position", transient_for=self, flags=0)
+        watch_titlebar(dialog)
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("Import", Gtk.ResponseType.OK)
         dialog.set_default_response(Gtk.ResponseType.OK)
@@ -2282,6 +2766,7 @@ class DragonangaWindow(Gtk.Window):
     @staticmethod
     def pgn_file_dialog(parent, title, action):
         dialog = Gtk.FileChooserDialog(title=title, transient_for=parent, action=action)
+        watch_titlebar(dialog)
         dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
                            "Save" if action == Gtk.FileChooserAction.SAVE else "Open", Gtk.ResponseType.OK)
         pgn = Gtk.FileFilter()
@@ -2318,6 +2803,7 @@ class DragonangaWindow(Gtk.Window):
 
     def on_import_pgn(self, _):
         dialog = Gtk.Dialog(title="Import PGN", transient_for=self, flags=0)
+        watch_titlebar(dialog)
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("Import", Gtk.ResponseType.OK)
         dialog.set_default_size(560, 400)
@@ -2337,6 +2823,7 @@ class DragonangaWindow(Gtk.Window):
         view = Gtk.TextView()
         view.set_monospace(True)
         view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        view.get_style_context().add_class("dragon-surface")
         scroll.add(view)
         box.pack_start(scroll, True, True, 0)
         buf = view.get_buffer()
@@ -2547,6 +3034,7 @@ class DragonangaWindow(Gtk.Window):
 
     def ask_promotion(self, matching_moves):
         dialog = Gtk.Dialog(title="Promote Piece", transient_for=self, flags=0)
+        watch_titlebar(dialog)
         box = dialog.get_content_area()
         box.set_spacing(6)
         box.pack_start(Gtk.Label(label="Choose promotion piece:"), False, False, 4)
@@ -2582,7 +3070,471 @@ class DragonangaWindow(Gtk.Window):
             self.last_move, self.notes,
             self.best_move if self.best_chk.get_active() and self.legal_moves and self.is_human_turn() else None,
             self.piece_images,
+            self.board_colours,
         )
+
+
+# ---------------------------------------------------------------------------
+# Visual Settings window, its colour picker and the Light / Dark switch
+# ---------------------------------------------------------------------------
+class ThemeSwitch:
+    """The sliding Light / Dark switch: the moon (Dark Mode) on the left, the sun (Light Mode) on the
+    right.  Click it, or use the space bar / arrow keys when it has the focus."""
+    WIDTH, HEIGHT = 64, 30
+
+    def __init__(self, light, on_toggle):
+        self.light = light
+        self.on_toggle = on_toggle               # called with True (Light) / False (Dark) after a click
+        self.pos = self.target = 1.0 if light else 0.0
+        self.timer = None
+        self.gone = False
+        self.widget = Gtk.DrawingArea()
+        self.widget.set_size_request(self.WIDTH, self.HEIGHT)
+        self.widget.set_can_focus(True)
+        self.widget.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.KEY_PRESS_MASK)
+        self.widget.set_tooltip_text("Light Mode (sun) / Dark Mode (moon)")
+        self.widget.connect("draw", self.on_draw)
+        self.widget.connect("button-press-event", self.on_press)
+        self.widget.connect("key-press-event", self.on_key)
+        self.widget.connect("destroy", self.on_destroy)
+
+    def on_destroy(self, *_):
+        self.gone = True
+
+    def on_draw(self, widget, cr):
+        draw_theme_switch(cr, self.WIDTH, self.HEIGHT, self.pos)
+        return False
+
+    def set_light(self, light):
+        """Slide the knob to Light or Dark without telling anyone."""
+        self.light = light
+        self.target = 1.0 if light else 0.0
+        if self.timer is None and abs(self.pos - self.target) > 0.01:
+            self.timer = GLib.timeout_add(16, self.step)
+        self.widget.queue_draw()
+
+    def step(self):
+        gap = self.target - self.pos
+        if self.gone or abs(gap) < 0.01:
+            self.pos = self.target
+            self.timer = None
+            if not self.gone:
+                self.widget.queue_draw()
+            return False
+        self.pos += gap * 0.25
+        self.widget.queue_draw()
+        return True
+
+    def choose(self, light):
+        if light != self.light:
+            self.set_light(light)
+            self.on_toggle(light)
+
+    def on_press(self, widget, event):
+        if event.button == 1:
+            widget.grab_focus()
+            self.choose(not self.light)
+        return True
+
+    def on_key(self, widget, event):
+        key = event.keyval
+        if key in (Gdk.KEY_space, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.choose(not self.light)
+        elif key == Gdk.KEY_Left:
+            self.choose(False)
+        elif key == Gdk.KEY_Right:
+            self.choose(True)
+        else:
+            return False
+        return True
+
+
+class ColourPickerDialog(Gtk.Dialog):
+    """A colour picker that needs nothing but GTK (so it looks and works the same on Windows and Linux):
+    click or drag in the square and on the rainbow bar, type the Red / Green / Blue numbers, or type
+    a hex code.  `on_change(hex)` is called on every change, so the board can follow along."""
+    SV_W, SV_H, HUE_H = 230, 170, 20
+
+    def __init__(self, parent, title, start_hex, on_change=None):
+        super().__init__(title=title, transient_for=parent, flags=0)
+        watch_titlebar(self)
+        self.on_change = on_change
+        self.syncing = False                     # True while the boxes are being filled in by the program
+        self.drag = None                         # "sv" or "hue" while the mouse button is down
+        self.start_rgb = parse_hex_colour(start_hex) or (255, 255, 255)
+        self.rgb = self.start_rgb
+        self.h, self.s, self.v = rgb_to_hsv(self.rgb)
+
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("OK", Gtk.ResponseType.OK)
+        self.set_default_response(Gtk.ResponseType.OK)
+        box = self.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(10)
+        main = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+        box.pack_start(main, True, True, 0)
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        main.pack_start(left, False, False, 0)
+        self.sv_area = self.make_area(self.SV_W, self.SV_H, self.on_draw_sv, "sv")
+        self.hue_area = self.make_area(self.SV_W, self.HUE_H, self.on_draw_hue, "hue")
+        left.pack_start(self.sv_area, False, False, 0)
+        left.pack_start(self.hue_area, False, False, 0)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        main.pack_start(right, True, True, 0)
+
+        compare = Gtk.Grid()
+        compare.set_column_spacing(8)
+        compare.set_row_spacing(4)
+        self.new_area = Gtk.DrawingArea()
+        self.new_area.set_size_request(96, 30)
+        self.new_area.connect("draw", lambda w, cr: self.paint_swatch(w, cr, self.rgb))
+        self.old_area = Gtk.DrawingArea()
+        self.old_area.set_size_request(96, 30)
+        self.old_area.connect("draw", lambda w, cr: self.paint_swatch(w, cr, self.start_rgb))
+        for row, (text, area) in enumerate((("New", self.new_area), ("Current", self.old_area))):
+            label = Gtk.Label(label=text)
+            label.set_xalign(0)
+            compare.attach(label, 0, row, 1, 1)
+            compare.attach(area, 1, row, 1, 1)
+        right.pack_start(compare, False, False, 0)
+
+        fields = Gtk.Grid()
+        fields.set_column_spacing(8)
+        fields.set_row_spacing(6)
+        self.spins = []
+        for row, (letter, value) in enumerate(zip("RGB", self.rgb)):
+            label = Gtk.Label(label=letter)
+            label.set_xalign(1)
+            spin = Gtk.SpinButton.new_with_range(0, 255, 1)
+            spin.set_value(value)
+            spin.set_width_chars(4)
+            fields.attach(label, 0, row, 1, 1)
+            fields.attach(spin, 1, row, 1, 1)
+            self.spins.append(spin)
+        hex_label = Gtk.Label(label="Hex")
+        hex_label.set_xalign(1)
+        self.hex_entry = Gtk.Entry()
+        self.hex_entry.set_max_length(7)
+        self.hex_entry.set_width_chars(9)
+        self.hex_entry.set_text(to_hex(self.rgb))
+        fields.attach(hex_label, 0, 3, 1, 1)
+        fields.attach(self.hex_entry, 1, 3, 1, 1)
+        right.pack_start(fields, False, False, 0)
+        for spin in self.spins:                  # connected last, so filling in the start values says nothing
+            spin.connect("value-changed", self.on_spin)
+        self.hex_entry.connect("changed", self.on_hex_changed)
+        self.hex_entry.connect("activate", lambda *_: self.normalise_hex())
+        self.hex_entry.connect("focus-out-event", lambda *_: self.normalise_hex())
+
+    def make_area(self, width, height, draw, kind):
+        area = Gtk.DrawingArea()
+        area.set_size_request(width, height)
+        area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK)
+        area.connect("draw", draw)
+        area.connect("button-press-event", lambda w, e: self.on_press(w, e, kind))
+        area.connect("motion-notify-event", lambda w, e: self.on_motion(w, e, kind))
+        area.connect("button-release-event", self.on_release)
+        return area
+
+    @staticmethod
+    def size_of(widget):
+        alloc = widget.get_allocation()
+        return max(1, alloc.width), max(1, alloc.height)
+
+    def on_draw_sv(self, widget, cr):
+        width, height = self.size_of(widget)
+        draw_sv_square(cr, width, height, self.h, self.s, self.v)
+        return False
+
+    def on_draw_hue(self, widget, cr):
+        width, height = self.size_of(widget)
+        draw_hue_strip(cr, width, height, self.h)
+        return False
+
+    @staticmethod
+    def paint_swatch(widget, cr, rgb):
+        alloc = widget.get_allocation()
+        draw_swatch(cr, alloc.width, alloc.height, tuple(c / 255.0 for c in rgb))
+        return False
+
+    # ----- mouse: dragging in the square / on the rainbow bar ---------------------------------------
+    def on_press(self, widget, event, kind):
+        if event.button != 1:
+            return False
+        self.drag = kind
+        self.drag_to(widget, event)
+        return True
+
+    def on_motion(self, widget, event, kind):
+        if self.drag != kind:
+            return False
+        self.drag_to(widget, event)
+        return True
+
+    def on_release(self, widget, event):
+        self.drag = None
+        return True
+
+    def drag_to(self, widget, event):
+        width, height = self.size_of(widget)
+        x = max(0.0, min(1.0, event.x / width))
+        if self.drag == "sv":
+            self.s = x
+            self.v = 1.0 - max(0.0, min(1.0, event.y / height))
+        else:
+            self.h = x
+        self.rgb = hsv_to_rgb(self.h, self.s, self.v)
+        self.push(skip=None)
+
+    # ----- the number boxes and the hex code -------------------------------------------------------
+    def on_spin(self, _spin):
+        if not self.syncing:
+            self.set_from_rgb(tuple(int(spin.get_value()) for spin in self.spins), skip="spin")
+
+    def on_hex_changed(self, entry):
+        if self.syncing:
+            return
+        rgb = parse_hex_colour(entry.get_text())
+        if rgb is not None:                      # half-typed codes are simply ignored
+            self.set_from_rgb(rgb, skip="hex")
+
+    def normalise_hex(self):
+        """Write the code as '#RRGGBB' again (after typing 'abc', or when the box is left)."""
+        self.syncing = True
+        self.hex_entry.set_text(to_hex(self.rgb))
+        self.syncing = False
+        return False
+
+    def set_from_rgb(self, rgb, skip):
+        self.rgb = tuple(rgb)
+        h, s, v = rgb_to_hsv(self.rgb)
+        if s > 0 and v > 0:                      # a grey has no hue of its own: keep the bar where it is
+            self.h = h
+        self.s, self.v = s, v
+        self.push(skip)
+
+    def push(self, skip):
+        """Show self.rgb in every part of the picker except the box the person is typing in."""
+        self.syncing = True
+        if skip != "spin":
+            for spin, value in zip(self.spins, self.rgb):
+                spin.set_value(value)
+        if skip != "hex":
+            self.hex_entry.set_text(to_hex(self.rgb))
+        self.syncing = False
+        for area in (self.sv_area, self.hue_area, self.new_area):
+            area.queue_draw()
+        if self.on_change is not None:
+            self.on_change(to_hex(self.rgb))
+
+    def choose(self):
+        """Show the picker and wait for it.  Returns the chosen '#RRGGBB', or None if it was cancelled."""
+        self.show_all()
+        response = self.run()
+        result = to_hex(self.rgb) if response == Gtk.ResponseType.OK else None
+        self.destroy()
+        return result
+
+
+class VisualSettingsWindow(Gtk.Window):
+    """Pieces, board colours, where the engine lines go, and Light / Dark mode.  Every choice is applied
+    at once (the main window is behind it, so you can watch), and remembered."""
+    PREVIEW = 56
+
+    def __init__(self, app):
+        super().__init__(title="Visual Settings", transient_for=app, destroy_with_parent=True)
+        watch_titlebar(self)
+        self.app = app
+        self.syncing = False
+        self.set_resizable(False)
+        self.set_border_width(18)
+        self.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        self.connect("destroy", self.on_destroy)
+        self.connect("key-press-event", self.on_key)
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(16)
+        grid.set_row_spacing(18)
+        self.add(grid)
+
+        # Pieces, with a Dragon beside the list as a preview
+        grid.attach(self.caption("Pieces:"), 0, 0, 1, 1)
+        self.piece_combo = Gtk.ComboBoxText()
+        for name in app.piece_set_names:
+            self.piece_combo.append_text(name)
+        self.piece_combo.set_active(app.piece_set_names.index(app.piece_set_name))
+        self.piece_combo.set_valign(Gtk.Align.CENTER)
+        self.piece_combo.connect("changed", self.on_piece_changed)
+        grid.attach(self.piece_combo, 1, 0, 1, 1)
+        self.piece_preview = self.preview_area(self.on_draw_piece)
+        grid.attach(self.piece_preview, 2, 0, 1, 1)
+
+        # Board colors: Classic / Green / Blue / Custom (two clickable swatches), with a 4-square preview
+        grid.attach(self.caption("Board colors:"), 0, 1, 1, 1)
+        scheme_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        scheme_box.set_valign(Gtk.Align.CENTER)
+        self.scheme_combo = Gtk.ComboBoxText()
+        for _key, name in SCHEME_CHOICES:
+            self.scheme_combo.append_text(name)
+        self.scheme_combo.set_active([key for key, _name in SCHEME_CHOICES].index(app.board_scheme))
+        self.scheme_combo.connect("changed", self.on_scheme_changed)
+        scheme_box.pack_start(self.scheme_combo, False, False, 0)
+        self.swatch_buttons, self.swatch_areas = {}, {}
+        for which, tip in (("light", "Light squares: click to choose a colour"),
+                           ("dark", "Dark squares: click to choose a colour")):
+            button, area = self.make_swatch(which, tip)
+            scheme_box.pack_start(button, False, False, 0)
+            self.swatch_buttons[which], self.swatch_areas[which] = button, area
+        grid.attach(scheme_box, 1, 1, 1, 1)
+        self.board_preview = self.preview_area(self.on_draw_checker)
+        grid.attach(self.board_preview, 2, 1, 1, 1)
+
+        # Engine lines: Top or Bottom
+        grid.attach(self.caption("Engine lines:"), 0, 2, 1, 1)
+        lines_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        self.radio_top = Gtk.RadioButton.new_with_label_from_widget(None, "Top")
+        self.radio_bottom = Gtk.RadioButton.new_with_label_from_widget(self.radio_top, "Bottom")
+        self.radio_top.set_tooltip_text("Above the Eval line")
+        self.radio_bottom.set_tooltip_text("At the bottom of the window")
+        (self.radio_top if app.lines_position == "top" else self.radio_bottom).set_active(True)
+        self.radio_top.connect("toggled", lambda b: self.on_lines_position(b, "top"))
+        self.radio_bottom.connect("toggled", lambda b: self.on_lines_position(b, "bottom"))
+        lines_box.pack_start(self.radio_top, False, False, 0)
+        lines_box.pack_start(self.radio_bottom, False, False, 0)
+        grid.attach(lines_box, 1, 2, 2, 1)
+
+        # Light / Dark
+        grid.attach(self.caption("Appearance:"), 0, 3, 1, 1)
+        mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.switch = ThemeSwitch(app.theme_name == "light", self.on_switch)
+        self.switch.widget.set_valign(Gtk.Align.CENTER)
+        self.mode_label = Gtk.Label(label=self.mode_text())
+        mode_box.pack_start(self.switch.widget, False, False, 0)
+        mode_box.pack_start(self.mode_label, False, False, 0)
+        grid.attach(mode_box, 1, 3, 2, 1)
+
+        close = Gtk.Button(label="Close")
+        close.set_halign(Gtk.Align.END)
+        close.connect("clicked", lambda _b: self.destroy())
+        grid.attach(close, 0, 4, 3, 1)
+
+    # ----- small builders ---------------------------------------------------------------------------
+    @staticmethod
+    def caption(text):
+        label = Gtk.Label(label=text)
+        label.set_xalign(0)
+        label.set_valign(Gtk.Align.CENTER)
+        return label
+
+    def preview_area(self, draw):
+        area = Gtk.DrawingArea()
+        area.set_size_request(self.PREVIEW, self.PREVIEW)
+        area.set_valign(Gtk.Align.CENTER)
+        area.connect("draw", draw)
+        return area
+
+    def make_swatch(self, which, tooltip):
+        button = Gtk.Button()
+        area = Gtk.DrawingArea()
+        area.set_size_request(34, 20)
+        area.connect("draw", lambda w, cr: self.on_draw_swatch(w, cr, which))
+        button.add(area)
+        button.set_tooltip_text(tooltip)
+        button.connect("clicked", lambda _b: self.pick_colour(which))
+        button.set_no_show_all(True)             # only visible while the board is Custom
+        area.show()
+        return button, area
+
+    def mode_text(self):
+        return "Light Mode" if self.app.theme_name == "light" else "Dark Mode"
+
+    def after_show(self):
+        """show_all() skips the swatches (they appear only for Custom), so this sets them up."""
+        self.update_swatches()
+
+    def update_swatches(self):
+        for button in self.swatch_buttons.values():
+            if self.app.board_scheme == CUSTOM:
+                button.show()
+            else:
+                button.hide()
+
+    def refresh_previews(self):
+        """The main window changed something: redraw the pictures and make the controls agree."""
+        self.syncing = True
+        try:
+            app = self.app
+            if app.piece_set_name in app.piece_set_names:
+                self.piece_combo.set_active(app.piece_set_names.index(app.piece_set_name))
+            self.scheme_combo.set_active([key for key, _name in SCHEME_CHOICES].index(app.board_scheme))
+            (self.radio_top if app.lines_position == "top" else self.radio_bottom).set_active(True)
+            self.switch.set_light(app.theme_name == "light")
+            self.mode_label.set_text(self.mode_text())
+        finally:
+            self.syncing = False
+        self.update_swatches()
+        for area in (self.piece_preview, self.board_preview, *self.swatch_areas.values()):
+            area.queue_draw()
+
+    # ----- drawing ---------------------------------------------------------------------------------
+    def on_draw_piece(self, widget, cr):
+        draw_piece_preview(cr, self.PREVIEW, self.app.board_colours, self.app.piece_images)
+        return False
+
+    def on_draw_checker(self, widget, cr):
+        colours = self.app.board_colours
+        draw_checker(cr, self.PREVIEW, colours["light"], colours["dark"])
+        return False
+
+    def on_draw_swatch(self, widget, cr, which):
+        light_hex, dark_hex = self.app.current_scheme_hexes()
+        alloc = widget.get_allocation()
+        draw_swatch(cr, alloc.width, alloc.height, hex_to_unit(light_hex if which == "light" else dark_hex))
+        return False
+
+    # ----- the controls ----------------------------------------------------------------------------
+    def on_piece_changed(self, combo):
+        idx = combo.get_active()
+        if not self.syncing and 0 <= idx < len(self.app.piece_set_names):
+            self.app.use_piece_set(self.app.piece_set_names[idx])
+
+    def on_scheme_changed(self, combo):
+        idx = combo.get_active()
+        if not self.syncing and 0 <= idx < len(SCHEME_CHOICES):
+            self.app.set_board_scheme(SCHEME_CHOICES[idx][0])
+            self.update_swatches()
+
+    def on_lines_position(self, button, position):
+        if button.get_active() and not self.syncing:
+            self.app.set_lines_position(position)
+
+    def on_switch(self, light):
+        self.app.set_theme("light" if light else "dark")
+        self.mode_label.set_text(self.mode_text())
+
+    def pick_colour(self, which):
+        """Open the colour picker for the light or dark squares of the Custom board."""
+        app = self.app
+        light_hex, dark_hex = app.current_scheme_hexes()
+        old = light_hex if which == "light" else dark_hex
+        picker = ColourPickerDialog(
+            self, "Light squares" if which == "light" else "Dark squares", old,
+            on_change=lambda hex_colour: app.set_custom_colour(which, hex_colour, commit=False))
+        chosen = picker.choose()                 # the board followed the picker; Cancel puts the old colour back
+        app.set_custom_colour(which, chosen or old, commit=bool(chosen))
+
+    def on_key(self, widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.destroy()
+            return True
+        return False
+
+    def on_destroy(self, *_):
+        if self.app.visual_win is self:
+            self.app.visual_win = None
 
 
 ENGINE_NAMES = ("dragonanga-engine", "stockfish", "fairy-stockfish")
@@ -2732,6 +3684,7 @@ def show_error(text, parent=None):
     extra = {"transient_for": parent} if parent is not None else {}
     dialog = Gtk.MessageDialog(
         message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE, text=text, **extra)
+    watch_titlebar(dialog)
     dialog.run()
     dialog.destroy()
 
