@@ -2019,9 +2019,9 @@ class DragonangaWindow(Gtk.Window):
         scroll.set_shadow_type(Gtk.ShadowType.IN)
         scroll.set_size_request(-1, LINES_BOX_HEIGHT)
         scroll.set_min_content_height(LINES_BOX_HEIGHT)
-        scroll.get_style_context().add_class("dragon-surface")      # same white as the move list
+        # Same white as the move list.
+        scroll.get_style_context().add_class("dragon-surface")
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        inner.get_style_context().add_class("dragon-surface")
         inner.set_margin_start(6)
         inner.set_margin_top(3)
         inner.set_margin_bottom(3)
