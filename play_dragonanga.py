@@ -364,9 +364,9 @@ def board_colours(scheme, custom_light=None, custom_dark=None):
     light, dark = hex_to_unit(light_hex), hex_to_unit(dark_hex)
 
     def letters(square, other):          # the other square's colour, unless that is too faint to read
-        if contrast_ratio(square, other) >= 2.0:
+        if contrast_ratio(square, other) >= 1.20:
             return other
-        return (0.12, 0.12, 0.12) if relative_luminance(square) > 0.35 else (0.94, 0.94, 0.94)
+        return (0.12, 0.12, 0.12) if max(relative_luminance(square), relative_luminance(other)) > 0.12 else (0.94, 0.94, 0.94)
 
     if scheme in ("classic", "blue"):    # the Lichess look: a green-yellow wash, green dots
         mark = (155 / 255.0, 199 / 255.0, 0.0, 0.41)
