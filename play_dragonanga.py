@@ -68,6 +68,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -501,6 +502,7 @@ def theme_css(theme):
         ".dragon-surface, .dragon-surface viewport, .dragon-surface text "
         f"{{ background-color: {theme['surface']}; color: {theme['text']}; }}\n"
         "button.compact { padding: 0px 8px; min-height: 0px; min-width: 0px; }\n"
+        "button.pausebtn { padding: 3px 5px; min-height: 0px; min-width: 0px; }\n"
     ).encode()
 
 
@@ -1583,6 +1585,24 @@ def draw_theme_switch(cr, width, height, pos):
         draw_sun(cr, kx, height / 2.0, icon, (0.98, 0.62, 0.10))
 
 
+def set_process_frozen(proc, frozen):
+    """Freeze / unfreeze a child process: it uses no CPU while frozen and carries on exactly where it was.
+    Windows: NtSuspendProcess / NtResumeProcess (what Process Explorer and psutil use); elsewhere SIGSTOP /
+    SIGCONT.  Returns True if it worked."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            call = getattr(ctypes.WinDLL("ntdll"), "NtSuspendProcess" if frozen else "NtResumeProcess")
+            call.argtypes = [wintypes.HANDLE]
+            call.restype = ctypes.c_long
+            return call(int(proc._handle)) == 0          # an NTSTATUS: 0 = success
+        os.kill(proc.pid, signal.SIGSTOP if frozen else signal.SIGCONT)
+        return True
+    except Exception:
+        return False
+
+
 class UCIEngine:
     def __init__(self, exe_path):
         self.proc = subprocess.Popen(
@@ -1599,6 +1619,7 @@ class UCIEngine:
         self._stop_lock = threading.Lock()  # guards _active_cancel
         self._active_cancel = None          # cancel token of the search that is running now
         self.sent_options = {}              # options set through search(options=...), to send changes only
+        self.frozen = False                 # True while the process is suspended (the Pause button)
         self.send("uci")
         self.wait_for("uciok")
         self.send("setoption name UCI_Variant value dragonanga")
@@ -1609,7 +1630,20 @@ class UCIEngine:
             self.proc.stdin.write(cmd + "\n")
             self.proc.stdin.flush()
 
+    def freeze(self):
+        """Suspend the engine process: no CPU, memory and search kept.  True if it is frozen now."""
+        if not self.frozen and set_process_frozen(self.proc, True):
+            self.frozen = True
+        return self.frozen
+
+    def unfreeze(self):
+        """Let a frozen engine carry on.  True if it is running (again)."""
+        if self.frozen and set_process_frozen(self.proc, False):
+            self.frozen = False
+        return not self.frozen
+
     def close(self):
+        self.unfreeze()                  # a frozen engine could not hear "quit"
         try:
             self.send("quit")
         except Exception:
@@ -1884,6 +1918,7 @@ class Analyzer:
         self.pump = None
         self.gen = 0                 # grows with every restart / stop
         self.want_text = False       # True while the Lines box is visible (notation is only built then)
+        self.frozen = False          # True while the search is frozen by Pause (the same search carries on after)
 
     def analyse(self, start_fen, moves, stm, fullmove, lines, threads, fresh=False):
         """Point the analysis at this position.  Returns True if a new search was started and False if
@@ -1923,7 +1958,24 @@ class Analyzer:
         if self.pump is not None:
             self.pump.wake.set()
 
+    def freeze(self):
+        """Pause: freeze the engine process, so the search keeps all it has found and resumes where it was.
+        True if frozen, False if that did not work, None if there was no search to freeze."""
+        if self.frozen:
+            return True
+        if self.cancel is None:
+            return None
+        self.frozen = self.engine.freeze()
+        return self.frozen
+
+    def thaw(self):
+        """Resume a frozen search (and make sure the process is running, whatever happens next)."""
+        if self.frozen or self.engine.frozen:
+            self.engine.unfreeze()
+        self.frozen = False
+
     def _stop_search(self):
+        self.thaw()                  # a frozen engine cannot hear "stop"
         if self.cancel is not None:
             self.engine.request_stop(self.cancel)
             self.cancel = None
@@ -1961,6 +2013,11 @@ class DragonangaWindow(Gtk.Window):
         self.grip_hover = None                 # 'x' / 'y' while the pointer is over a grip
         self.grip_drag = None                  # (which, pointer start, alignment at the start) while dragging
         self.eval_layout_pending = False
+        self.paused = False                    # Pause button: never saved, every start is un-paused
+        self.pause_note = ""                   # extra words for the status line while paused
+        self.paused_pos = None                 # the position the numbers on screen belong to while paused
+        self.resuming = False                  # True during the sync_board() that follows a resume
+        self.depth_floor = None                # after a resume: results below this depth are not shown
         self.visual_win = None                 # the Visual Settings window while it is open
         watch_titlebar(self)
         width, height = WINDOW_SIZE
@@ -2056,14 +2113,31 @@ class DragonangaWindow(Gtk.Window):
         self.lines_chk = self.add_toggle(row2, "Lines", "Show the engine's best lines")
         self.best_chk = self.add_toggle(row2, "Suggestion", "Draw the engine's best move on the board")
 
+        # Pause / Resume: a small button with a drawn icon (two bars while running, a triangle while paused)
+        self.btn_pause = Gtk.Button()
+        self.pause_icon = Gtk.DrawingArea()
+        self.pause_icon.set_size_request(12, 14)
+        self.pause_icon.connect("draw", self.on_draw_pause)
+        self.btn_pause.add(self.pause_icon)
+        self.btn_pause.get_style_context().add_class("pausebtn")
+        self.btn_pause.set_valign(Gtk.Align.CENTER)
+        self.btn_pause.set_focus_on_click(False)
+        self.btn_pause.connect("clicked", lambda _b: self.set_paused(not self.paused))
+        self.pause_icon.show()
+        row2.pack_start(self.btn_pause, False, False, 0)
+        self.update_pause_button()
+
         self.time_spin = Gtk.SpinButton.new_with_range(0.5, 30.0, 0.5)
         self.time_spin.set_value(2.0)
         self.time_spin.set_tooltip_text("Thinking time per engine move at Strength 8 (levels 1-7 use short fixed times).")
         self.pack_spin_right(row2, "Think Time (sec):", self.time_spin)
 
         # Status & Eval labels
+        # One status line: "Mode: .. | Move: .. | Legal moves: .. | FEN: ..".  It is clipped with "..." instead of
+        # making the window wider; the whole text is its tooltip.
         self.status_label = Gtk.Label(label="Ready")
         self.status_label.set_xalign(0)
+        self.status_label.set_ellipsize(Pango.EllipsizeMode.END)
         vbox.pack_start(self.status_label, False, False, 2)
 
         eval_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -2417,6 +2491,7 @@ class DragonangaWindow(Gtk.Window):
         self.theme = apply_gtk_theme(name)
         self.colour_move_tags()
         self.eval_bar.queue_draw()
+        self.pause_icon.queue_draw()
         self.area.queue_draw()
         for window in (self, self.visual_win):
             if window is not None and os.name == "nt":
@@ -2743,6 +2818,15 @@ class DragonangaWindow(Gtk.Window):
                     c += 1
         return grid
 
+    def set_status(self, text, markup=None):
+        """The status line.  `markup` (Pango) is shown if given, else the plain text.  It is clipped to the
+        window width, so the whole plain text is also its tooltip."""
+        if markup is None:
+            self.status_label.set_text(text)
+        else:
+            self.status_label.set_markup(markup)
+        self.status_label.set_tooltip_text(text)
+
     def sync_board(self):
         self.fen, self.legal_moves, self.in_check = self.engine.get_state(self.moves, self.start_fen)
         turn = "White" if self.turn_color() == "w" else "Black"
@@ -2755,13 +2839,16 @@ class DragonangaWindow(Gtk.Window):
             if self.moves:  # position before the last move, to tell a baremate from a stalemate
                 prev_fen = self.engine.get_state(self.moves[:-1], self.start_fen, quiet=True)[0]
             self.final_outcome = game_outcome(self.fen, self.in_check, prev_fen)
-            self.status_label.set_text(game_over_text(self.fen, self.in_check, prev_fen))
+            self.set_status(game_over_text(self.fen, self.in_check, prev_fen))
         else:
             chk = " (IN CHECK!)" if self.in_check else ""
-            self.status_label.set_text(
-                f"Mode: {mode} | Move: {turn}{chk} | Legal moves: {len(self.legal_moves)} | "
-                f"FEN: {engine_fen_to_designer(self.fen)}"
-            )
+            paused = (" | PAUSED" + self.pause_note) if self.paused else ""
+            fen = engine_fen_to_designer(self.fen)
+            esc = html.escape
+            self.set_status(                                    # the four labels are bold
+                f"Mode: {mode}{paused} | Move: {turn}{chk} | Legal moves: {len(self.legal_moves)} | FEN: {fen}",
+                f"<b>Mode:</b> {esc(mode)}{esc(paused)} | <b>Move:</b> {turn}{esc(chk)} | "
+                f"<b>Legal moves:</b> {len(self.legal_moves)} | <b>FEN:</b> {esc(fen)}")
         self.update_analysis()
         self.area.queue_draw()
         self.refresh_move_list()
@@ -2988,9 +3075,71 @@ class DragonangaWindow(Gtk.Window):
             break
         dialog.destroy()
 
+    # ----- Pause -----------------------------------------------------------------------------------
+    PAUSE_TIP = ("Pause: freeze the analysis (the computer rests, nothing is lost) and stop the computer's moves.\n"
+                 "What is on screen stays.")
+    RESUME_TIP = "Resume: the analysis carries on exactly where it was, and the computer can move again"
+
+    def position_key(self):
+        return (self.start_fen, tuple(self.moves))
+
+    def update_pause_button(self):
+        self.btn_pause.set_tooltip_text(self.RESUME_TIP if self.paused else self.PAUSE_TIP)
+        self.pause_icon.queue_draw()
+
+    def on_draw_pause(self, widget, cr):
+        """Two bars while running (click to pause), a triangle while paused (click to resume)."""
+        alloc = widget.get_allocation()
+        w, h = alloc.width, alloc.height
+        r, g, b = hex_to_unit(self.theme["text"])
+        cr.set_source_rgb(r, g, b)
+        if self.paused:
+            x0, y0, x1, y1 = (w - 10) / 2.0, (h - 12) / 2.0, (w + 10) / 2.0, (h + 12) / 2.0
+            cr.move_to(x0, y0)
+            cr.line_to(x1, (y0 + y1) / 2.0)
+            cr.line_to(x0, y1)
+            cr.close_path()
+            cr.fill()
+        else:
+            top, bar_h = (h - 12) / 2.0, 12
+            cr.rectangle((w - 10) / 2.0, top, 4, bar_h)
+            cr.rectangle((w + 10) / 2.0 - 4, top, 4, bar_h)
+            cr.fill()
+        return False
+
+    def set_paused(self, on):
+        """Pause: the analysis stops and the computer does not move; the evaluation, lines and arrow stay
+        as they are.  Resume: the analysis carries on and the computer moves if it is its turn."""
+        on = bool(on)
+        if on == self.paused:
+            return
+        self.paused = on
+        self.update_pause_button()
+        if on:
+            self.cancel_engine_move()                 # its answer is dropped; it moves again after a resume
+            self.paused_pos = self.position_key()
+            self.depth_floor = None
+            frozen = self.analyzer.freeze()           # the search stays exactly where it is, using no CPU
+            self.pause_note = ""
+            if frozen is False:                       # freezing did not work here: stop it (it restarts on resume)
+                self.analyzer.stop()
+                self.pause_note = " (analysis stopped, not frozen: it restarts on resume)"
+            elif frozen is None:
+                self.analyzer.stop()                  # nothing was searching (game over)
+            self.sync_board()                         # the status line says "PAUSED"
+        else:
+            self.pause_note = ""
+            self.analyzer.thaw()                      # a frozen search just carries on
+            self.resuming = True
+            try:
+                self.sync_board()                     # starts analysing the position again
+            finally:
+                self.resuming = False
+            self.maybe_engine_move()
+
     # ----- engine's own moves ------------------------------------------------------
     def maybe_engine_move(self):
-        if self.thinking or not self.legal_moves or self.is_human_turn():
+        if self.paused or self.thinking or not self.legal_moves or self.is_human_turn():
             return
         self.trigger_engine_move()
 
@@ -3000,7 +3149,7 @@ class DragonangaWindow(Gtk.Window):
         gen = self.engine_gen
         cancel = threading.Event()
         self.engine_cancel = cancel
-        self.status_label.set_text("Fairy-Stockfish is thinking...")
+        self.set_status("Fairy-Stockfish is thinking...")
         skill, depth, movetime_ms = strength_settings(
             self.strength_spin.get_value(), int(self.time_spin.get_value() * 1000))
         moves, start_fen = list(self.moves), self.start_fen
@@ -3044,18 +3193,36 @@ class DragonangaWindow(Gtk.Window):
             self.best_move, self.analysis_lines = None, []
             outcome = self.final_outcome
             self.show_final_eval(outcome[1] if outcome else None)
+        elif self.paused:                             # nothing is searched, and nothing on screen is erased...
+            here = self.position_key()
+            wanted = here + (int(self.lines_spin.get_value()), int(self.threads_spin.get_value()))
+            if self.analyzer.frozen and self.analyzer.key != wanted:
+                self.analyzer.stop()                  # the frozen search is of something else now: end it
+            if here != self.paused_pos:               # ...unless the board moved on: those numbers are now wrong
+                self.paused_pos = here
+                self.best_move, self.analysis_lines = None, []
+                self.clear_eval()
         else:
             restarted = self.analyzer.analyse(
                 self.start_fen, list(self.moves), self.turn_color(), self.fullmove_number(),
                 int(self.lines_spin.get_value()), int(self.threads_spin.get_value()), fresh=self.analysis_fresh)
             self.analysis_fresh = False
-            if restarted:                             # the old arrow and lines belong to the old position
-                self.best_move, self.analysis_lines = None, []
+            if restarted:
+                if self.resuming and self.eval_info:  # the same position as before the pause: keep showing the
+                    self.depth_floor = self.eval_info.get("depth")   # old numbers until the new search is as deep
+                else:                                 # the old arrow and lines belong to the old position
+                    self.best_move, self.analysis_lines = None, []
+                    self.depth_floor = None
         self.refresh_lines_panel()
 
     def on_analysis_lines(self, gen, results):
         if gen != self.analyzer.gen or not results:
             return False                              # a result of a position we have left
+        if self.depth_floor is not None:              # just resumed: a shallower result would replace deeper numbers
+            reached = results[0].get("depth")
+            if reached is None or reached < self.depth_floor:
+                return False
+            self.depth_floor = None
         self.analysis_lines = results
         top = results[0]
         previous = self.best_move
@@ -3081,7 +3248,7 @@ class DragonangaWindow(Gtk.Window):
                     rows[i] = format_line_row(info)
                     tips[i] = format_line_tooltip(info)
             else:
-                rows[0] = "Analysing\u2026"
+                rows[0] = "Paused" if self.paused else "Analysing\u2026"
         if (shown, rows, tips) == self.line_cache:
             return                                    # nothing to change (this runs several times a second)
         self.line_cache = (shown, rows, tips)
