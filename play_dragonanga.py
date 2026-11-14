@@ -117,7 +117,11 @@ MAX_INDENT = 8     # deepest variation level that is indented further
 DEFAULT_LINES = 3  # engine lines calculated / shown to start with
 MAX_LINES = 5      # most lines the Lines box can show
 DEFAULT_THREADS = 2
-MAX_PLIES = 10     # plies shown per line
+MAX_PLIES = 200    # safety limit on the plies of one line (the engine's own limit is 246); a line is
+                   # converted whole and the Lines box clips it to the width of the window
+TOOLTIP_WIDTH = 90 # width of the tooltip that shows a whole engine line, in characters (it wraps there)
+GRIP_MIN_GAP = 40  # blank pixels beside / below the board before its alignment grips appear
+ALIGN_STOPS = (0.0, 0.5, 1.0)   # left / centre / right (top / centre / bottom): what double-click cycles
 ANALYSIS_HASH_MB = 128    # memory of the always-on analysis engine
 LINES_BOX_HEIGHT = 76     # pixels: the Lines box is about three lines tall, more lines scroll
 WINDOW_SIZE = (840, 780)  # wide enough for the toolbar; the move list fits in the space beside the board
@@ -190,6 +194,83 @@ def point_to_sq(x, y, size, flipped):
     if not (0 <= r < 8 and 0 <= c < 8):
         return None
     return screen_to_sq(r, c, flipped)
+
+
+def board_layout(width, height, align_x, align_y):
+    """Where the board sits in its drawing area: (size, left, top, free_x, free_y).  The board is a square
+    of the shorter side; the blank space left over (free_x beside it, free_y below it) is shared out by
+    the alignment fractions (0 = left / top, 0.5 = centre, 1 = right / bottom)."""
+    size = max(0, min(width, height))
+    free_x, free_y = max(0, width - size), max(0, height - size)
+    return (size, int(round(free_x * min(1.0, max(0.0, align_x)))),
+            int(round(free_y * min(1.0, max(0.0, align_y)))), free_x, free_y)
+
+
+def next_align_stop(value):
+    """Double-click on a grip: the stop after the one nearest to `value` (left -> centre -> right -> left)."""
+    nearest = min(range(len(ALIGN_STOPS)), key=lambda i: abs(ALIGN_STOPS[i] - value))
+    return ALIGN_STOPS[(nearest + 1) % len(ALIGN_STOPS)]
+
+
+def snap_align(fraction, free, tolerance=8):
+    """Dragging: clamp to 0..1 and stick to the centre when within `tolerance` pixels of it."""
+    fraction = min(1.0, max(0.0, fraction))
+    if free > 0 and abs(fraction - 0.5) * free <= tolerance:
+        return 0.5
+    return fraction
+
+
+GRIP_COLOUR = (0.5, 0.5, 0.5, 0.85)       # the grips: grey, blue while the pointer is on one
+GRIP_ACTIVE = (0.2, 0.52, 0.95, 1.0)
+GRIP_LONG, GRIP_SHORT, GRIP_GAP = 20, 12, 4    # the three little lines: size of the mark, distance to the board
+
+
+def grip_rects(width, height, left, top, size, free_x, free_y):
+    """The two alignment grips as (x, y, w, h) rectangles, or None while there is too little blank space.
+    'x' (three upright lines, drags sideways) sits by the bottom-right corner of the board, or the bottom-left
+    one when the board is already against the right edge.  'y' (three flat lines, drags up and down) sits under
+    the bottom-right corner, or above the top-right one when the board is already at the bottom."""
+    out = {"x": None, "y": None}
+    if free_x >= GRIP_MIN_GAP:
+        x = left + size + GRIP_GAP
+        if x + GRIP_SHORT > width:
+            x = left - GRIP_GAP - GRIP_SHORT
+        out["x"] = (x, top + size - GRIP_LONG, GRIP_SHORT, GRIP_LONG)
+    if free_y >= GRIP_MIN_GAP:
+        y = top + size + GRIP_GAP
+        if y + GRIP_SHORT > height:
+            y = top - GRIP_GAP - GRIP_SHORT
+        out["y"] = (left + size - GRIP_LONG, y, GRIP_LONG, GRIP_SHORT)
+    return out
+
+
+def hit_grip(rects, x, y, slop=5):
+    """Which grip ('x' or 'y') is under the point, if any (a few pixels of slack make it easy to catch)."""
+    for name, rect in rects.items():
+        if rect and rect[0] - slop <= x <= rect[0] + rect[2] + slop and rect[1] - slop <= y <= rect[1] + rect[3] + slop:
+            return name
+    return None
+
+
+def draw_grip(cr, rect, vertical_lines, colour):
+    """Three short lines in `rect`: upright ones for the sideways grip, flat ones for the up-down grip."""
+    x, y, w, h = rect
+    cr.set_source_rgba(*colour)
+    for i in range(3):
+        if vertical_lines:
+            cr.rectangle(x + 1 + i * 4, y, 2, h)
+        else:
+            cr.rectangle(x, y + 1 + i * 4, w, 2)
+        cr.fill()
+
+
+def eval_margins(left, size, avail, min_width):
+    """(start margin, end margin) that give the Eval bar line the board's width, starting at the board's left
+    edge.  `avail` is the room up to the buttons.  Never so large that the line needs more room than there is
+    (that would make the window grow), so a board pushed right gets a shorter bar that ends at the buttons."""
+    start = max(0, min(left, avail - min_width))
+    end = max(0, min(avail - start - size, avail - start - min_width))
+    return int(start), int(end)
 
 
 def other_side(side):
@@ -284,6 +365,13 @@ def format_line_row(info):
     return f"{info['score']:>7}  d{depth:<3} {info.get('text', '')}"
 
 
+def format_line_tooltip(info):
+    """The whole engine line for the tooltip: a heading, then the numbered moves as ONE paragraph.  The
+    tooltip's label wraps it (see on_line_tooltip); breaking it here as well would wrap it twice."""
+    depth = info["depth"] if info["depth"] is not None else "?"
+    return f"{info['score']}   depth {depth}\n{info.get('text', '')}"
+
+
 # ----- colours: board colour schemes and the Light / Dark themes ----------------------------------------
 HEX_COLOUR = re.compile(r"^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
@@ -356,14 +444,18 @@ def scheme_hexes(scheme, custom_light=None, custom_dark=None):
     return entry[1], entry[2]
 
 
-def board_colours(scheme, custom_light=None, custom_dark=None):
+def board_colours(scheme, custom_light=None, custom_dark=None, high_contrast=False):
     """Everything draw_board needs to know about colour (r, g, b as 0..1, alphas where see-through):
     the two squares, the mark on the last move, the selected square, the legal-move dots and the
-    coordinate letters.  The marks are drawn over the square, so they work on any colours."""
+    coordinate letters.  The marks are drawn over the square, so they work on any colours.
+    high_contrast=True writes every coordinate in black or white, whichever reads better on its square."""
     light_hex, dark_hex = scheme_hexes(scheme, custom_light, custom_dark)
     light, dark = hex_to_unit(light_hex), hex_to_unit(dark_hex)
 
     def letters(square, other):          # the other square's colour, unless that is too faint to read
+        if high_contrast:                # forced: pure black or white, the one with more contrast
+            black, white = (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
+            return black if contrast_ratio(square, black) >= contrast_ratio(square, white) else white
         if contrast_ratio(square, other) >= 1.20:
             return other
         return (0.12, 0.12, 0.12) if max(relative_luminance(square), relative_luminance(other)) > 0.12 else (0.94, 0.94, 0.94)
@@ -492,6 +584,9 @@ SETTINGS_DEFAULTS = {
     "custom_dark": None,
     "lines_position": DEFAULT_LINES_POSITION,
     "theme": DEFAULT_THEME,
+    "high_contrast_coords": False,   # coordinates forced to black / white
+    "board_align_x": 0.0,       # where the board sits in blank space beside it: 0 = left, 0.5 = centre, 1 = right
+    "board_align_y": 0.0,       # ... and in blank space below it: 0 = top, 0.5 = centre, 1 = bottom
 }
 
 
@@ -520,7 +615,7 @@ def sanitize_settings(raw):
     out = dict(SETTINGS_DEFAULTS)
     if not isinstance(raw, dict):
         return out
-    for key in ("show_eval", "show_lines", "show_suggestion", "show_move_list"):
+    for key in ("show_eval", "show_lines", "show_suggestion", "show_move_list", "high_contrast_coords"):
         if isinstance(raw.get(key), bool):
             out[key] = raw[key]
     for key, low, high in (("lines", 1, MAX_LINES), ("threads", 1, max_threads())):
@@ -538,6 +633,10 @@ def sanitize_settings(raw):
     for key in ("custom_light", "custom_dark"):
         rgb = parse_hex_colour(raw.get(key))
         out[key] = to_hex(rgb) if rgb else None
+    for key in ("board_align_x", "board_align_y"):
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            out[key] = max(0.0, min(1.0, float(value)))
     return out
 
 
@@ -1854,8 +1953,14 @@ class DragonangaWindow(Gtk.Window):
         self.board_scheme = self.prefs["board_scheme"]
         self.custom_light = self.prefs["custom_light"]    # '#RRGGBB' or None (not chosen yet)
         self.custom_dark = self.prefs["custom_dark"]
-        self.board_colours = board_colours(self.board_scheme, self.custom_light, self.custom_dark)
         self.lines_position = self.prefs["lines_position"]
+        self.high_contrast = self.prefs["high_contrast_coords"]
+        self.board_colours = board_colours(self.board_scheme, self.custom_light, self.custom_dark, self.high_contrast)
+        self.align_x = self.prefs["board_align_x"]        # where the board sits in the blank space beside it
+        self.align_y = self.prefs["board_align_y"]        # ... and below it
+        self.grip_hover = None                 # 'x' / 'y' while the pointer is over a grip
+        self.grip_drag = None                  # (which, pointer start, alignment at the start) while dragging
+        self.eval_layout_pending = False
         self.visual_win = None                 # the Visual Settings window while it is open
         watch_titlebar(self)
         width, height = WINDOW_SIZE
@@ -2026,10 +2131,13 @@ class DragonangaWindow(Gtk.Window):
         inner.set_margin_top(3)
         inner.set_margin_bottom(3)
         self.line_labels = []
+        self.line_tips = [""] * MAX_LINES
         for _ in range(MAX_LINES):
             lbl = Gtk.Label(label="")
             lbl.set_xalign(0)
             lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            lbl.set_has_tooltip(True)             # the tooltip is made on demand: the whole line, wrapped
+            lbl.connect("query-tooltip", self.on_line_tooltip)
             inner.pack_start(lbl, False, False, 0)
             self.line_labels.append(lbl)
         scroll.add(inner)
@@ -2063,8 +2171,11 @@ class DragonangaWindow(Gtk.Window):
             Gdk.EventMask.BUTTON_PRESS_MASK
             | Gdk.EventMask.BUTTON_RELEASE_MASK
             | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
         )
         self.area.connect("draw", self.on_draw)
+        self.area.connect("leave-notify-event", self.on_leave)
+        self.area.connect("size-allocate", self.on_area_allocated)
         self.area.connect("button-press-event", self.on_press)
         self.area.connect("button-release-event", self.on_release)
         self.area.connect("motion-notify-event", self.on_motion)
@@ -2235,9 +2346,16 @@ class DragonangaWindow(Gtk.Window):
         return scheme_hexes(self.board_scheme, self.custom_light, self.custom_dark)
 
     def update_board_colours(self):
-        self.board_colours = board_colours(self.board_scheme, self.custom_light, self.custom_dark)
+        self.board_colours = board_colours(self.board_scheme, self.custom_light, self.custom_dark, self.high_contrast)
         self.area.queue_draw()
         self.refresh_visual_window()
+
+    def set_high_contrast(self, on):
+        if bool(on) == self.high_contrast:
+            return
+        self.high_contrast = bool(on)
+        self.update_board_colours()
+        self.save_prefs()
 
     def set_board_scheme(self, scheme):
         if scheme == self.board_scheme or scheme not in dict(SCHEME_CHOICES):
@@ -2443,6 +2561,9 @@ class DragonangaWindow(Gtk.Window):
             "custom_dark": self.custom_dark,
             "lines_position": self.lines_position,
             "theme": self.theme_name,
+            "high_contrast_coords": self.high_contrast,
+            "board_align_x": round(self.align_x, 4),
+            "board_align_y": round(self.align_y, 4),
         }
 
     def save_prefs(self):
@@ -2949,6 +3070,7 @@ class DragonangaWindow(Gtk.Window):
         """Fill the Lines box (the labels are only rewritten, the box never changes size)."""
         shown = int(self.lines_spin.get_value())
         rows = [""] * MAX_LINES
+        tips = [""] * MAX_LINES                           # the whole line, for the tooltip
         if self.lines_chk.get_active():
             if not self.legal_moves:
                 pass
@@ -2957,23 +3079,148 @@ class DragonangaWindow(Gtk.Window):
             elif self.analysis_lines:
                 for i, info in enumerate(self.analysis_lines[:shown]):
                     rows[i] = format_line_row(info)
+                    tips[i] = format_line_tooltip(info)
             else:
                 rows[0] = "Analysing\u2026"
-        if (shown, rows) == self.line_cache:
+        if (shown, rows, tips) == self.line_cache:
             return                                    # nothing to change (this runs several times a second)
-        self.line_cache = (shown, rows)
+        self.line_cache = (shown, rows, tips)
         for i, lbl in enumerate(self.line_labels):
             if i < shown:
                 lbl.show()
             else:
                 lbl.hide()
             lbl.set_markup(f"<tt>{html.escape(rows[i])}</tt>")
-            lbl.set_tooltip_text(rows[i] or None)
+            self.line_tips[i] = tips[i] or rows[i]
+
+    def on_line_tooltip(self, label, x, y, keyboard_mode, tooltip):
+        """Tooltip of an engine line: the whole line in a label that wraps at TOOLTIP_WIDTH characters, so
+        every wrapped line is full (GTK's own tooltip wraps at its own width, which broke the lines twice)."""
+        text = self.line_tips[self.line_labels.index(label)]
+        if not text:
+            return False
+        tip = Gtk.Label(label=text)
+        tip.set_xalign(0)
+        tip.set_line_wrap(True)
+        tip.set_max_width_chars(TOOLTIP_WIDTH)
+        tip.show()
+        tooltip.set_custom(tip)
+        return True
 
     # ----- mouse -------------------------------------------------------------
-    def event_to_sq(self, x, y):
+    def board_box(self):
+        """(size, left, top, free_x, free_y) of the board inside its drawing area, right now."""
         alloc = self.area.get_allocation()
-        return point_to_sq(x, y, min(alloc.width, alloc.height), self.flipped)
+        return board_layout(alloc.width, alloc.height, self.align_x, self.align_y)
+
+    def grips(self):
+        alloc = self.area.get_allocation()
+        size, left, top, free_x, free_y = self.board_box()
+        return grip_rects(alloc.width, alloc.height, left, top, size, free_x, free_y)
+
+    def event_to_sq(self, x, y):
+        size, left, top, _fx, _fy = self.board_box()
+        return point_to_sq(x - left, y - top, size, self.flipped)
+
+    # ----- the board's alignment grips ---------------------------------------------------------------
+    def set_alignment(self, x=None, y=None, save=True):
+        """Move the board in the blank space around it (fractions 0..1) and keep the Eval bar with it."""
+        if x is not None:
+            self.align_x = min(1.0, max(0.0, x))
+        if y is not None:
+            self.align_y = min(1.0, max(0.0, y))
+        self.area.queue_draw()
+        self.schedule_eval_layout()
+        if save:
+            self.save_prefs()
+
+    def start_grip_drag(self, which, event):
+        self.grip_drag = (which, event.x if which == "x" else event.y, self.align_x if which == "x" else self.align_y)
+
+    def drag_grip(self, event):
+        which, start, align0 = self.grip_drag
+        _size, _left, _top, free_x, free_y = self.board_box()
+        free = free_x if which == "x" else free_y
+        if free <= 0:
+            return
+        here = event.x if which == "x" else event.y
+        fraction = snap_align(align0 + (here - start) / float(free), free)
+        if which == "x":
+            self.set_alignment(x=fraction, save=False)
+        else:
+            self.set_alignment(y=fraction, save=False)
+
+    def end_grip_drag(self):
+        if self.grip_drag is not None:
+            self.grip_drag = None
+            self.save_prefs()
+
+    def cycle_grip(self, which):
+        """Double-click: left -> centre -> right (top -> centre -> bottom) and round again."""
+        self.grip_drag = None
+        if which == "x":
+            self.set_alignment(x=next_align_stop(self.align_x))
+        else:
+            self.set_alignment(y=next_align_stop(self.align_y))
+
+    def update_grip_hover(self, which):
+        if which == self.grip_hover:
+            return
+        self.grip_hover = which
+        tip = None
+        if which:
+            tip = ("Drag to move the board sideways. Double-click: left, centre, right."
+                   if which == "x" else "Drag to move the board up or down. Double-click: top, centre, bottom.")
+        self.area.set_tooltip_text(tip)
+        try:
+            win = self.area.get_window()
+            if win is not None:
+                name = {"x": "ew-resize", "y": "ns-resize"}.get(which)
+                win.set_cursor(Gdk.Cursor.new_from_name(win.get_display(), name) if name else None)
+        except Exception:
+            pass                                          # a missing cursor is only cosmetic
+        self.area.queue_draw()
+
+    def on_leave(self, widget, event):
+        if self.grip_drag is None:
+            self.update_grip_hover(None)
+        return False
+
+    def on_area_allocated(self, widget, allocation):
+        self.schedule_eval_layout()
+
+    def schedule_eval_layout(self):
+        """Fit the Eval line to the board.  Done from the main loop, never from inside a layout pass."""
+        if not self.eval_layout_pending:
+            self.eval_layout_pending = True
+            GLib.idle_add(self.layout_eval_line)
+
+    def layout_eval_line(self):
+        """The Eval bar runs from the board's left edge to its right edge ("+0.1 [bar] Depth: 27").  When the
+        board is pushed to the right, the Visual Settings button would cross the board's right edge, so the
+        bar is shortened to end at the button, as it does in a narrow window."""
+        self.eval_layout_pending = False
+        try:
+            size, left, _top, _fx, _fy = self.board_box()
+            row, button = self.eval_row.get_allocation(), self.btn_visual.get_allocation()
+            if size <= 0 or row.width <= 1 or button.width <= 1:
+                return False                                  # not laid out yet
+            avail = button.x - 8 - row.x                      # room to the left of the buttons
+            start, end = eval_margins(left, size, avail, self.eval_min_width())
+            if (start, end) != (self.eval_box.get_margin_start(), self.eval_box.get_margin_end()):
+                self.eval_box.set_margin_start(start)
+                self.eval_box.set_margin_end(end)
+        except Exception:
+            pass                                              # the Eval line is cosmetic: never break the app
+        return False
+
+    def eval_min_width(self):
+        """The least width the Eval bar line needs (score + bar + depth), without the margins set on it."""
+        try:
+            width = self.eval_box.get_preferred_width()[0]
+            return max(120, int(width) - self.eval_box.get_margin_start() - self.eval_box.get_margin_end())
+        except Exception:
+            return 300
 
     @staticmethod
     def brush_for(state):
@@ -2986,6 +3233,14 @@ class DragonangaWindow(Gtk.Window):
         return "green"
 
     def on_press(self, widget, event):
+        if event.button == 1:
+            grip = hit_grip(self.grips(), event.x, event.y)
+            if grip:
+                if event.type == Gdk.EventType._2BUTTON_PRESS:
+                    self.cycle_grip(grip)
+                else:
+                    self.start_grip_drag(grip, event)
+                return True
         sq = self.event_to_sq(event.x, event.y)
         if event.button == 3:
             if sq:
@@ -2998,6 +3253,10 @@ class DragonangaWindow(Gtk.Window):
         return True
 
     def on_motion(self, widget, event):
+        if self.grip_drag is not None:
+            self.drag_grip(event)
+            return True
+        self.update_grip_hover(hit_grip(self.grips(), event.x, event.y))
         if self.notes.drag_from is not None:
             sq = self.event_to_sq(event.x, event.y)
             if sq != self.notes.drag_to:
@@ -3006,6 +3265,9 @@ class DragonangaWindow(Gtk.Window):
         return True
 
     def on_release(self, widget, event):
+        if event.button == 1 and self.grip_drag is not None:
+            self.end_grip_drag()
+            return True
         if event.button == 3 and self.notes.drag_from is not None:
             self.notes.finish(self.event_to_sq(event.x, event.y))
             self.area.queue_draw()
@@ -3056,8 +3318,7 @@ class DragonangaWindow(Gtk.Window):
 
     # ----- drawing -----------------------------------------------------------
     def on_draw(self, widget, cr):
-        alloc = self.area.get_allocation()
-        size = min(alloc.width, alloc.height)
+        size, left, top, _free_x, _free_y = self.board_box()
 
         targets = set()
         if self.selected_sq:
@@ -3065,6 +3326,8 @@ class DragonangaWindow(Gtk.Window):
                 if m.startswith(self.selected_sq):
                     targets.add(m[2:4])
 
+        cr.save()
+        cr.translate(left, top)
         draw_board(
             cr, size, self.parse_fen_grid(), self.flipped, self.selected_sq, targets,
             self.last_move, self.notes,
@@ -3072,6 +3335,11 @@ class DragonangaWindow(Gtk.Window):
             self.piece_images,
             self.board_colours,
         )
+        cr.restore()
+        for which, rect in self.grips().items():              # the alignment grips, only when there is room
+            if rect:
+                active = self.grip_hover == which or (self.grip_drag is not None and self.grip_drag[0] == which)
+                draw_grip(cr, rect, which == "x", GRIP_ACTIVE if active else GRIP_COLOUR)
 
 
 # ---------------------------------------------------------------------------
@@ -3392,8 +3660,16 @@ class VisualSettingsWindow(Gtk.Window):
         self.board_preview = self.preview_area(self.on_draw_checker)
         grid.attach(self.board_preview, 2, 1, 1, 1)
 
+        # Coordinates (a-h, 1-8): by default they follow the board colours; this forces black / white
+        self.contrast_chk = Gtk.CheckButton(label="High contrast coordinates")
+        self.contrast_chk.set_tooltip_text("Always write the a-h and 1-8 coordinates in black or white,\n"
+                                           "whichever is easier to read on each square")
+        self.contrast_chk.set_active(app.high_contrast)
+        self.contrast_chk.connect("toggled", self.on_contrast_toggled)
+        grid.attach(self.contrast_chk, 1, 2, 2, 1)
+
         # Engine lines: Top or Bottom
-        grid.attach(self.caption("Engine lines:"), 0, 2, 1, 1)
+        grid.attach(self.caption("Engine lines:"), 0, 3, 1, 1)
         lines_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
         self.radio_top = Gtk.RadioButton.new_with_label_from_widget(None, "Top")
         self.radio_bottom = Gtk.RadioButton.new_with_label_from_widget(self.radio_top, "Bottom")
@@ -3404,22 +3680,22 @@ class VisualSettingsWindow(Gtk.Window):
         self.radio_bottom.connect("toggled", lambda b: self.on_lines_position(b, "bottom"))
         lines_box.pack_start(self.radio_top, False, False, 0)
         lines_box.pack_start(self.radio_bottom, False, False, 0)
-        grid.attach(lines_box, 1, 2, 2, 1)
+        grid.attach(lines_box, 1, 3, 2, 1)
 
         # Light / Dark
-        grid.attach(self.caption("Appearance:"), 0, 3, 1, 1)
+        grid.attach(self.caption("Appearance:"), 0, 4, 1, 1)
         mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self.switch = ThemeSwitch(app.theme_name == "light", self.on_switch)
         self.switch.widget.set_valign(Gtk.Align.CENTER)
         self.mode_label = Gtk.Label(label=self.mode_text())
         mode_box.pack_start(self.switch.widget, False, False, 0)
         mode_box.pack_start(self.mode_label, False, False, 0)
-        grid.attach(mode_box, 1, 3, 2, 1)
+        grid.attach(mode_box, 1, 4, 2, 1)
 
         close = Gtk.Button(label="Close")
         close.set_halign(Gtk.Align.END)
         close.connect("clicked", lambda _b: self.destroy())
-        grid.attach(close, 0, 4, 3, 1)
+        grid.attach(close, 0, 5, 3, 1)
 
     # ----- small builders ---------------------------------------------------------------------------
     @staticmethod
@@ -3471,6 +3747,7 @@ class VisualSettingsWindow(Gtk.Window):
                 self.piece_combo.set_active(app.piece_set_names.index(app.piece_set_name))
             self.scheme_combo.set_active([key for key, _name in SCHEME_CHOICES].index(app.board_scheme))
             (self.radio_top if app.lines_position == "top" else self.radio_bottom).set_active(True)
+            self.contrast_chk.set_active(app.high_contrast)
             self.switch.set_light(app.theme_name == "light")
             self.mode_label.set_text(self.mode_text())
         finally:
@@ -3506,6 +3783,10 @@ class VisualSettingsWindow(Gtk.Window):
         if not self.syncing and 0 <= idx < len(SCHEME_CHOICES):
             self.app.set_board_scheme(SCHEME_CHOICES[idx][0])
             self.update_swatches()
+
+    def on_contrast_toggled(self, chk):
+        if not self.syncing:
+            self.app.set_high_contrast(chk.get_active())
 
     def on_lines_position(self, button, position):
         if button.get_active() and not self.syncing:
