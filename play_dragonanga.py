@@ -7,6 +7,7 @@ Modes (the three buttons never reset the game, so you can swap sides mid-game)
   * Play as White / Play as Black   the engine plays the other side (board turns to match)
   * Analysis Mode                   you move both sides, the engine never plays by itself
   * New Game                        back to the starting position, keeps the current mode
+                                    (it asks first, unless you ticked "Do not ask again")
 
 Position
   * Import Position   paste a FEN written with the designer letters
@@ -40,14 +41,20 @@ Visual Settings (button at the right end of the Eval line; everything changes at
 
 Settings (settings.json in your user folder; delete it to start again with the defaults)
   Remembered: piece set, board colors, Light / Dark mode, where the engine lines go,
-  Eval / Lines / Suggestion / Move List, number of lines and threads.
+  Eval / Lines / Suggestion / Move List, number of lines and threads, the board position
+  (alignment), and whether New Game asks first ("confirm_new_game").
   Windows %APPDATA%\\Dragonanga, Linux ~/.config/Dragonanga (or $DRAGONANGA_CONFIG for any file).
-  The game itself is never saved: the app always starts a new game.
+  The game is remembered too: after every move the whole game (moves and variations, as PGN)
+  is written to the settings file ("active_pgn"), with the position you were on, who was playing
+  whom and which way the board faced, and the app opens with it. New Game clears it.
 
 Move list
   * Move List        tick it to show the game next to the board in designer notation. Click a move
                      to jump to that position. Playing a different move from an earlier position
-                     starts a variation (shown in brackets); nothing is ever deleted.
+                     starts a variation (shown in brackets).
+  * Right click a move   "Delete Moves": removes that move and everything after it (asks first).
+                     Inside a variation only that variation is touched; the first move of a variation
+                     removes the whole variation; a variation that branched at the same move moves up.
   * Undo Move / Redo Move   step back / forward (against the engine: your move and its reply)
   * Import PGN / Export PGN   below the list; variations are kept
 
@@ -589,7 +596,14 @@ SETTINGS_DEFAULTS = {
     "high_contrast_coords": False,   # coordinates forced to black / white
     "board_align_x": 0.0,       # where the board sits in blank space beside it: 0 = left, 0.5 = centre, 1 = right
     "board_align_y": 0.0,       # ... and in blank space below it: 0 = top, 0.5 = centre, 1 = bottom
-}
+    "confirm_new_game": True,   # New Game asks first; "Do not ask again" in that question turns this off
+    "active_pgn": None,         # the game being played (PGN text with its variations), None = nothing to restore
+    "active_position": None,    # the UCI moves, space-separated, to the position that was on the board
+                                # ("" = the start position; None = not known: show the end of the main line)
+    "active_mode": None,        # who was playing: "white", "black" or "analysis" (None = not known: Play as White)
+    "active_flipped": None,     # board turned round (None = not known)
+}                               # (the last three are only ever stored together with a game)
+MAX_SAVED_GAME = 2000000        # characters: a bigger "active_pgn" in the file is ignored (it is not a game)
 
 
 def max_threads():
@@ -617,7 +631,8 @@ def sanitize_settings(raw):
     out = dict(SETTINGS_DEFAULTS)
     if not isinstance(raw, dict):
         return out
-    for key in ("show_eval", "show_lines", "show_suggestion", "show_move_list", "high_contrast_coords"):
+    for key in ("show_eval", "show_lines", "show_suggestion", "show_move_list", "high_contrast_coords",
+                "confirm_new_game"):
         if isinstance(raw.get(key), bool):
             out[key] = raw[key]
     for key, low, high in (("lines", 1, MAX_LINES), ("threads", 1, max_threads())):
@@ -639,6 +654,15 @@ def sanitize_settings(raw):
         value = raw.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
             out[key] = max(0.0, min(1.0, float(value)))
+    game, at = raw.get("active_pgn"), raw.get("active_position")
+    if isinstance(game, str) and game.strip() and len(game) <= MAX_SAVED_GAME:
+        out["active_pgn"] = game
+        if isinstance(at, str) and re.fullmatch(r"[a-z0-9 ]*", at) and len(at) <= MAX_SAVED_GAME:
+            out["active_position"] = " ".join(at.split())
+        if isinstance(raw.get("active_mode"), str) and raw["active_mode"] in MODES:
+            out["active_mode"] = raw["active_mode"]
+        if isinstance(raw.get("active_flipped"), bool):
+            out["active_flipped"] = raw["active_flipped"]
     return out
 
 
@@ -660,6 +684,11 @@ def save_settings(values, path=None):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(values, f, indent=2, sort_keys=True)
             f.write("\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())          # on the disk before it replaces the old file: a power cut
+            except OSError:                   # cannot leave an empty settings file behind
+                pass
         os.replace(tmp, path)
         return True
     except OSError:
@@ -990,6 +1019,113 @@ class GameTree:
         """Full-move number of the move `node` (1 for the first move of a normal game)."""
         return self.start_fullmove + (node.ply - 1 + (0 if self.start_stm == "w" else 1)) // 2
 
+    def line_level(self, node):
+        """How deep in variations the move `node` is: 0 = main line, 1 = a variation of it, 2 = a
+        variation of a variation ..."""
+        level = 0
+        while node.parent is not None:
+            if node is not node.parent.children[0]:
+                level += 1
+            node = node.parent
+        return level
+
+    def line_length(self, node):
+        """Moves in the line that starts at `node` and follows the main continuation (variations not counted)."""
+        count = 0
+        while node is not None:
+            count += 1
+            node = node.children[0] if node.children else None
+        return count
+
+    def subtree_size(self, node):
+        """`node` and every move after it, variations included."""
+        count, stack = 0, [node]
+        while stack:
+            current = stack.pop()
+            count += 1
+            stack.extend(current.children)
+        return count
+
+    def contains(self, ancestor, node):
+        """True if `node` is `ancestor` or comes after it (anywhere below it)."""
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = node.parent
+        return False
+
+    def delete_from(self, node):
+        """Delete the move `node` and everything after it (the whole branch below it, variations included).
+
+        Only the branch goes: the moves BESIDE it (the other children of its parent) stay.  So deleting
+        the first move of a variation removes the variation, and deleting a main continuation that has
+        variations lets the first of them move up one level (it becomes the new main continuation, or
+        the continuation of the variation the deleted move was in).  Returns (the parent, moves removed)."""
+        parent = node.parent
+        if parent is None:
+            raise ValueError("The start position is not a move.")
+        parent.children[:] = [child for child in parent.children if child is not node]
+        removed, stack = 0, [node]
+        while stack:
+            gone = stack.pop()
+            removed += 1
+            self.nodes.pop(gone.id, None)
+            stack.extend(gone.children)
+        if parent.redo is node:
+            parent.redo = None
+        return parent, removed
+
+
+def move_label(tree, node):
+    """'14. Gc3' for a White move, '14... Sc6' for a Black one."""
+    return f"{tree.fullmove(node)}{'.' if tree.mover(node) == 'w' else '...'} {node.san}"
+
+
+def delete_moves_text(tree, node, board_moves_back=False):
+    """The warning shown before 'Delete Moves' on `node` -> (heading, text).  It says exactly what will
+    happen in this tree: how many moves go, whether a variation is touched or removed, and which
+    variation (if any) moves up.  `board_moves_back`: the position on the board is among the deleted moves."""
+    parent = node.parent
+    label = move_label(tree, node)
+    level = tree.line_level(node)
+    total = tree.subtree_size(node)
+    first_of_variation = node is not parent.children[0]
+    alternatives = [] if first_of_variation else parent.children[1:]
+
+    def moves(n):
+        return "1 move" if n == 1 else f"{n} moves"
+
+    paras = []
+    if first_of_variation:
+        paras.append(f"{label} is the first move of a variation, so that whole variation ({moves(total)}) "
+                     "will be removed. The line it branches from, and every other line, stays as it is.")
+    else:
+        line_len = tree.line_length(node)
+        if line_len == 1:
+            paras.append(f"The move {label} will be deleted (it is the last move of its line).")
+        else:
+            paras.append(f"All moves from and including {label} will be deleted ({moves(line_len)}).")
+        extra = total - line_len
+        if extra:
+            paras.append(f"Variations that branch off those moves go with them ({extra} more move{'' if extra == 1 else 's'}).")
+        if level:
+            paras.append("This move is inside a variation, so only that variation is affected: the line it "
+                         "branches from, and every other line, stays as it is.")
+        if alternatives:
+            alt = move_label(tree, alternatives[0])
+            if level == 0:
+                paras.append(f"The variation at the same move number ({alt} ...) is not deleted: it moves up "
+                             "to become the main line.")
+            else:
+                paras.append(f"The variation at the same move number ({alt} ...) is not deleted: it moves up "
+                             "one level and takes the place of the deleted moves in this variation.")
+            if len(alternatives) > 1:
+                paras.append("The other variations at that move number stay variations, beside it.")
+    if board_moves_back:
+        paras.append(f"The board goes back to the position before {label}.")
+    paras.append("This cannot be undone.")
+    return f"Delete moves from {label}?", "\n\n".join(paras)
+
 
 # ----- the move list text -----------------------------------------------------
 Seg = collections.namedtuple("Seg", "text node style level")   # style: num, move, paren or plain
@@ -1149,9 +1285,11 @@ def split_pgn(text):
     return tags, "\n".join(body)
 
 
-def pgn_to_tree(text, converter):
+def pgn_to_tree(text, converter, allow_empty=False):
     """Read the first game of a PGN text into a GameTree.  Raises ValueError with a readable message
-    if the text has no moves, a bad FEN tag, an illegal move or unbalanced parentheses."""
+    if the text has no moves, a bad FEN tag, an illegal move or unbalanced parentheses.
+    allow_empty: a game with no moves is fine as long as it has a position (a FEN tag) - that is how
+    an imported position nobody has played on yet is remembered."""
     tags, body = split_pgn(text)
     start_fen = None
     if tags.get("FEN") and tags.get("SetUp", "1") != "0":
@@ -1188,7 +1326,7 @@ def pgn_to_tree(text, converter):
             played += 1
     if stack:
         raise ValueError("A variation '(' is never closed.")
-    if not played:
+    if not played and not (allow_empty and start_fen):
         raise ValueError("No moves found in the PGN.")
     return tree
 
@@ -1256,7 +1394,7 @@ def grid_piece(grid, name):
 
 
 DOT_RADIUS = 0.18      # of a square: the legal-move dot
-X_EXTRA = 0.05         # the capture X reaches this much further than the dot (about 5 px of diameter at 80 px)
+X_EXTRA = 0.05         # the capture X reaches this much further than the dot
 X_WIDTH = 0.14         # thickness of the X's strokes, of a square: heavy, like the dot
 
 
@@ -2057,6 +2195,9 @@ class DragonangaWindow(Gtk.Window):
         self.board_colours = board_colours(self.board_scheme, self.custom_light, self.custom_dark, self.high_contrast)
         self.align_x = self.prefs["board_align_x"]        # where the board sits in the blank space beside it
         self.align_y = self.prefs["board_align_y"]        # ... and below it
+        self.confirm_new_game = self.prefs["confirm_new_game"]   # New Game asks first (until "Do not ask again")
+        self.restore_problem = None            # why the saved game could not be opened (told to the user once)
+        self.move_menu = None                  # the right-click menu of the move list while it is open
         self.grip_hover = None                 # 'x' / 'y' while the pointer is over a grip
         self.grip_drag = None                  # (which, pointer start, alignment at the start) while dragging
         self.eval_layout_pending = False
@@ -2126,7 +2267,7 @@ class DragonangaWindow(Gtk.Window):
         row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         vbox.pack_start(row1, False, False, 0)
         for label, handler in (
-            ("New Game", lambda _: self.new_game()),
+            ("New Game", lambda _: self.on_new_game()),
             ("Play as White", lambda _: self.set_mode("white")),
             ("Play as Black", lambda _: self.set_mode("black")),
             ("Analysis Mode", lambda _: self.set_mode("analysis")),
@@ -2318,8 +2459,11 @@ class DragonangaWindow(Gtk.Window):
         self.move_chk.set_active(self.prefs["show_move_list"])
 
         self.set_mode("white")
-        self.new_game()
+        if not self.restore_active_game():
+            self.new_game()
         self.loading_prefs = False
+        if self.restore_problem:               # said once the window is up
+            GLib.idle_add(self.report_restore_problem)
 
     # ----- move list panel -------------------------------------------------------
     def build_move_panel(self, body):
@@ -2340,6 +2484,7 @@ class DragonangaWindow(Gtk.Window):
         self.move_view.set_top_margin(4)
         self.move_view.set_bottom_margin(4)
         self.move_view.connect("button-release-event", self.on_move_list_click)
+        self.move_view.connect("button-press-event", self.on_move_list_press)
         self.move_view.get_style_context().add_class("dragon-surface")
         scroll.add(self.move_view)
         self.side.pack_start(scroll, True, True, 0)
@@ -2425,16 +2570,88 @@ class DragonangaWindow(Gtk.Window):
             return self.tree.nodes.get(self.move_spans[i][2])
         return None
 
-    def on_move_list_click(self, view, event):
-        if event.button != 1 or view.get_buffer().get_has_selection():
-            return False                        # not a plain left click (e.g. the end of a text selection)
+    def node_at_event(self, view, event):
+        """The move written under the mouse pointer in the move list, or None."""
         x, y = view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(event.x), int(event.y))
         found = view.get_iter_at_location(x, y)     # newer GTK returns (over_text, iter)
         over_text, it = found if isinstance(found, tuple) else (True, found)
-        node = self.node_at_offset(it.get_offset()) if over_text else None
+        return self.node_at_offset(it.get_offset()) if over_text else None
+
+    def on_move_list_click(self, view, event):
+        if event.button != 1 or view.get_buffer().get_has_selection():
+            return False                        # not a plain left click (e.g. the end of a text selection)
+        node = self.node_at_event(view, event)
         if node is not None:
             self.go_to(node)
         return False
+
+    def on_move_list_press(self, view, event):
+        """Right click on a move: a small menu with "Delete Moves".  Anywhere else the text box keeps its
+        own menu (Copy / Select All)."""
+        if event.button != 3:
+            return False
+        node = self.node_at_event(view, event)
+        if node is None:
+            return False
+        menu = Gtk.Menu()
+        item = Gtk.MenuItem(label="Delete Moves")
+        item.connect("activate", lambda _item: self.delete_moves(node))
+        menu.append(item)
+        menu.attach_to_widget(view, None)
+        menu.show_all()
+        self.move_menu = menu                   # keep it alive while it is on screen
+        try:
+            menu.popup_at_pointer(event)
+        except AttributeError:                  # GTK older than 3.22
+            menu.popup(None, None, None, None, event.button, event.time)
+        return True
+
+    def confirm_delete_moves(self, node, board_moves_back):
+        """The warning before moves are deleted.  True = go ahead.  Cancel is the default button, so a
+        stray Enter key never deletes anything."""
+        heading, text = delete_moves_text(self.tree, node, board_moves_back)
+        dialog = Gtk.MessageDialog(transient_for=self, flags=0, message_type=Gtk.MessageType.WARNING,
+                                   buttons=Gtk.ButtonsType.NONE, text=heading)
+        dialog.set_title("Delete Moves")
+        dialog.set_property("secondary-text", text)
+        watch_titlebar(dialog)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        delete = dialog.add_button("Delete Moves", Gtk.ResponseType.OK)
+        try:
+            delete.get_style_context().add_class("destructive-action")     # red button in themes that have one
+        except Exception:
+            pass
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        answer = dialog.run()
+        dialog.destroy()
+        return answer == Gtk.ResponseType.OK
+
+    def delete_moves(self, node):
+        """Delete `node` and everything after it from the game (after asking).  Returns True if it did.
+        Variations: see GameTree.delete_from."""
+        if node is None or node.parent is None or self.tree.nodes.get(node.id) is not node:
+            return False
+        if not self.confirm_delete_moves(node, self.tree.contains(node, self.current)):
+            return False
+        if self.tree.nodes.get(node.id) is not node:
+            return False                        # the game changed while the question was open
+        was_inside = self.tree.contains(node, self.current)
+        parent, _removed = self.tree.delete_from(node)
+        if was_inside:                          # the position on the board is gone: back to just before it
+            self.cancel_engine_move()
+            self.current = parent
+            self.tree.visit(parent)
+            self.selected_sq = None
+            self.last_move = parent.move
+            self.notes.clear()
+            self.sync_board()                   # also redraws the list and saves the game
+            if not parent.children:
+                self.maybe_engine_move()
+        else:                                   # the board is untouched: nothing is restarted
+            self.update_history_buttons()
+            self.refresh_move_list()
+            self.autosave_game()
+        return True
 
     def load_piece_set(self, name):
         """Select the named picture set (TOKENS = the built-in drawn pieces)."""
@@ -2669,7 +2886,20 @@ class DragonangaWindow(Gtk.Window):
         if not self.loading_prefs:
             self.update_analysis()
 
+    def active_game(self):
+        """The game to remember between runs -> (PGN text, UCI moves to the position on the board).  A game
+        without moves and without an imported position is nothing to remember: (None, None)."""
+        if not self.has_game_data():
+            return None, None
+        return tree_to_pgn(self.tree), " ".join(self.tree.moves(self.current))
+
+    def autosave_game(self):
+        """Write the game into the settings file.  Called after every change of the game, so a power cut
+        or a crash loses nothing."""
+        self.save_prefs()
+
     def current_prefs(self):
+        game, at = self.active_game()
         return {
             "piece_set": self.piece_set_name,
             "show_eval": self.eval_chk.get_active(),
@@ -2686,6 +2916,11 @@ class DragonangaWindow(Gtk.Window):
             "high_contrast_coords": self.high_contrast,
             "board_align_x": round(self.align_x, 4),
             "board_align_y": round(self.align_y, 4),
+            "confirm_new_game": self.confirm_new_game,
+            "active_pgn": game,
+            "active_position": at,
+            "active_mode": self.mode if game else None,       # who plays whom is part of the game: reopening it
+            "active_flipped": self.flipped if game else None,  # on your own turn must not let the engine move for you
         }
 
     def save_prefs(self):
@@ -2736,6 +2971,7 @@ class DragonangaWindow(Gtk.Window):
             if mode in ("white", "black"):
                 self.flipped = mode == "black"
                 self.area.queue_draw()
+                self.save_prefs()
             return
         self.cancel_engine_move()
         self.mode = mode
@@ -2762,6 +2998,43 @@ class DragonangaWindow(Gtk.Window):
         self.clear_eval()
         self.sync_board()
         self.maybe_engine_move()
+
+    def has_game_data(self):
+        """True if there is anything a New Game would throw away: moves, or an imported position."""
+        return bool(self.tree.root.children) or self.tree.start_fen is not None
+
+    def on_new_game(self):
+        """The New Game button.  It asks first when there is a game to lose (and the question has not
+        been switched off with "Do not ask again")."""
+        if self.confirm_new_game and self.has_game_data() and not self.ask_new_game():
+            return
+        self.new_game()
+
+    def ask_new_game(self):
+        """"Are you sure?" with a "Do not ask again" box.  True = start the new game.  The box only counts
+        when the answer is yes: Cancel changes nothing."""
+        dialog = Gtk.MessageDialog(transient_for=self, flags=0, message_type=Gtk.MessageType.QUESTION,
+                                   buttons=Gtk.ButtonsType.NONE, text="Start a new game?")
+        dialog.set_title("New Game")
+        dialog.set_property("secondary-text",
+                            "Any moves you have not saved (Export PGN) will be lost.\n"
+                            "Are you sure you want to continue?")
+        watch_titlebar(dialog)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("New Game", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        again = Gtk.CheckButton(label="Do not ask again")
+        dialog.get_message_area().pack_start(again, False, False, 6)
+        again.show()
+        answer = dialog.run()
+        dont_ask = again.get_active()
+        dialog.destroy()
+        if answer != Gtk.ResponseType.OK:
+            return False
+        if dont_ask:
+            self.confirm_new_game = False
+            self.save_prefs()
+        return True
 
     def on_undo(self, _):
         was_thinking = self.thinking
@@ -2832,6 +3105,7 @@ class DragonangaWindow(Gtk.Window):
     def on_flip(self, _):
         self.flipped = not self.flipped
         self.area.queue_draw()
+        self.save_prefs()
 
     @property
     def moves(self):
@@ -2874,12 +3148,15 @@ class DragonangaWindow(Gtk.Window):
             self.status_label.set_markup(markup)
         self.status_label.set_tooltip_text(text)
 
+    def update_history_buttons(self):
+        self.btn_undo.set_sensitive(undo_length(self.start_stm, self.current.ply, self.human_sides) is not None)
+        self.btn_redo.set_sensitive(self.tree.redo_child(self.current) is not None)
+
     def sync_board(self):
         self.fen, self.legal_moves, self.in_check = self.engine.get_state(self.moves, self.start_fen)
         turn = "White" if self.turn_color() == "w" else "Black"
         mode = MODES[self.mode][1]
-        self.btn_undo.set_sensitive(undo_length(self.start_stm, self.current.ply, self.human_sides) is not None)
-        self.btn_redo.set_sensitive(self.tree.redo_child(self.current) is not None)
+        self.update_history_buttons()
         self.final_outcome = None
         if not self.legal_moves:
             prev_fen = None
@@ -2899,6 +3176,7 @@ class DragonangaWindow(Gtk.Window):
         self.update_analysis()
         self.area.queue_draw()
         self.refresh_move_list()
+        self.autosave_game()
 
     # ----- importing a position ------------------------------------------------
     def check_start_position(self, engine_fen):
@@ -3004,10 +3282,14 @@ class DragonangaWindow(Gtk.Window):
         tree = pgn_to_tree(text, self.converter)
         if tree.start_fen:
             self.check_start_position(tree.start_fen)
+        self.adopt_tree(tree)
+
+    def adopt_tree(self, tree, current=None):
+        """Put a game tree on the board, at `current` (default: the end of the main line)."""
         self.cancel_engine_move()
         self.start_fen, self.start_stm = tree.start_fen, tree.start_stm
         self.tree = tree
-        self.current = tree.main_end()               # show the end of the main line
+        self.current = current or tree.main_end()
         tree.visit(self.current)
         self.selected_sq = None
         self.last_move = self.current.move
@@ -3016,7 +3298,50 @@ class DragonangaWindow(Gtk.Window):
         self.analysis_fresh = True
         self.clear_eval()
         self.sync_board()
-        self.maybe_engine_move()
+        if not self.current.children:                # the engine carries on only at the end of a line
+            self.maybe_engine_move()
+
+    @staticmethod
+    def node_for_path(tree, path):
+        """The position reached by the space-separated UCI moves `path` from the start (as far as they
+        exist in the tree)."""
+        node = tree.root
+        for move in path.split():
+            child = node.child_for(move)
+            if child is None:
+                break
+            node = child
+        return node
+
+    def restore_active_game(self):
+        """Open the game that was saved in the settings, on the position that was on the board.
+        True if there was one.  If it cannot be read (a damaged file, moves the engine no longer accepts)
+        this returns False and remembers why, so the app can say so and start a new game instead."""
+        text = self.prefs.get("active_pgn")
+        if not text:
+            return False
+        before = (self.mode, self.human_sides, self.flipped)
+        try:
+            tree = pgn_to_tree(text, self.converter, allow_empty=True)
+            if tree.start_fen:
+                self.check_start_position(tree.start_fen)
+            mode, flipped = self.prefs.get("active_mode"), self.prefs.get("active_flipped")
+            if mode in MODES:                     # who was playing whom, before the engine is asked to move
+                self.mode, self.human_sides = mode, set(MODES[mode][0])
+                self.flipped = flipped if flipped is not None else mode == "black"
+            at = self.prefs.get("active_position")
+            self.adopt_tree(tree, None if at is None else self.node_for_path(tree, at))
+        except Exception as e:
+            self.mode, self.human_sides, self.flipped = before
+            self.restore_problem = str(e) or e.__class__.__name__
+            return False
+        return True
+
+    def report_restore_problem(self):
+        show_error("Your last game could not be opened, so a new game was started.\n\n"
+                   f"{self.restore_problem}", self)
+        self.restore_problem = None
+        return False
 
     @staticmethod
     def pgn_file_dialog(parent, title, action):
