@@ -1247,6 +1247,38 @@ def _centre(name, flipped, sq):
     return (c + 0.5) * sq, (r + 0.5) * sq
 
 
+PROMO_HINT_ALPHA = 0.35   # the faded piece shown on the square when the suggested move is a promotion
+
+
+def grid_piece(grid, name):
+    """The piece on a square name ("e4") of the FEN grid (rank 8 first), "" if it is empty."""
+    return grid[8 - int(name[1:])][ord(name[0]) - 97]
+
+
+DOT_RADIUS = 0.18      # of a square: the legal-move dot
+X_EXTRA = 0.05         # the capture X reaches this much further than the dot (about 5 px of diameter at 80 px)
+X_WIDTH = 0.14         # thickness of the X's strokes, of a square: heavy, like the dot
+
+
+def draw_target_mark(cr, sq, cx, cy, rgba, capture):
+    """A legal-move mark in the middle of a square: a dot, or - where the move captures - a heavy X."""
+    cr.set_source_rgba(*rgba)
+    if not capture:
+        cr.arc(cx, cy, sq * DOT_RADIUS, 0, 6.283)
+        cr.fill()
+        return
+    tip = sq * (DOT_RADIUS + X_EXTRA)             # the farthest corner of the X from the centre
+    width = sq * X_WIDTH
+    arm = math.sqrt(tip * tip - (width / 2.0) ** 2) / math.sqrt(2.0)   # per axis, to the middle of an end
+    cr.set_line_width(width)
+    cr.set_line_cap(cairo.LINE_CAP_BUTT)
+    cr.move_to(cx - arm, cy - arm)                # both strokes are ONE path, so where they cross the
+    cr.line_to(cx + arm, cy + arm)                # colour is not laid on twice
+    cr.move_to(cx - arm, cy + arm)
+    cr.line_to(cx + arm, cy - arm)
+    cr.stroke()
+
+
 def draw_arrow(cr, sq, frm, to, flipped, rgb, alpha=0.8):
     x1, y1 = _centre(frm, flipped, sq)
     x2, y2 = _centre(to, flipped, sq)
@@ -1284,9 +1316,16 @@ def draw_circle(cr, sq, name, flipped, rgb, alpha=0.8):
     cr.stroke()
 
 
-def draw_piece(cr, piece, x, y, sq, images=None):
+def draw_piece(cr, piece, x, y, sq, images=None, alpha=1.0):
     """Draw one piece (engine letter, upper case = White) in the square whose top-left corner is (x, y):
-    a picture from the chosen set, or the built-in token."""
+    a picture from the chosen set, or the built-in token.  alpha < 1 draws it see-through (the whole piece
+    as one shape, so its parts do not show through each other)."""
+    if alpha < 1.0:
+        cr.push_group()
+        draw_piece(cr, piece, x, y, sq, images)
+        cr.pop_group_to_source()
+        cr.paint_with_alpha(max(0.0, alpha))
+        return
     picture = images.get(piece, sq * PIECE_IMAGE_SCALE) if (piece and images) else None
     if picture is not None:
         side = picture.get_width()
@@ -1359,12 +1398,6 @@ def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, 
                 cr.rectangle(c * sq, r * sq, sq, sq)
                 cr.fill()
 
-            # Legal move target dot
-            if name in targets:
-                cr.set_source_rgba(*colours["dot"])
-                cr.arc((c + 0.5) * sq, (r + 0.5) * sq, sq * 0.18, 0, 6.283)
-                cr.fill()
-
             # Coordinate labels (follow the board orientation)
             cr.set_source_rgb(*colours["letters_on_light" if light else "letters_on_dark"])
             if c == 0:
@@ -1379,6 +1412,14 @@ def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, 
             # Piece: a picture from the chosen set, or the built-in token
             draw_piece(cr, grid[br][bc], c * sq, r * sq, sq, images)
 
+    # Legal-move marks go on top of the pieces: a dot, or an X on a square where the move captures
+    for r in range(8):
+        for c in range(8):
+            name = screen_to_sq(r, c, flipped)
+            if name in targets:
+                br, bc = (7 - r, 7 - c) if flipped else (r, c)
+                draw_target_mark(cr, sq, (c + 0.5) * sq, (r + 0.5) * sq, colours["dot"], bool(grid[br][bc]))
+
     # Overlays: circles, user arrows, engine best move, live preview while dragging
     for name, brush in notes.circles:
         draw_circle(cr, sq, name, flipped, BRUSHES[brush])
@@ -1386,6 +1427,12 @@ def draw_board(cr, size, grid, flipped, selected_sq, targets, last_move, notes, 
         draw_arrow(cr, sq, frm, to, flipped, BRUSHES[brush])
     if best_move and len(best_move) >= 4:
         draw_arrow(cr, sq, best_move[:2], best_move[2:4], flipped, BEST_COLOR, 0.85)
+        if len(best_move) > 4:                       # a promotion: show what to promote to, faded, on its square
+            mover = grid_piece(grid, best_move[:2])
+            if mover:
+                promoted = best_move[4:5].upper() if mover.isupper() else best_move[4:5].lower()
+                cx, cy = _centre(best_move[2:4], flipped, sq)
+                draw_piece(cr, promoted, cx - sq / 2.0, cy - sq / 2.0, sq, images, PROMO_HINT_ALPHA)
     if notes.drag_from is not None and notes.drag_to is not None:
         rgb = BRUSHES[notes.drag_brush]
         if notes.drag_to == notes.drag_from:
@@ -3450,6 +3497,9 @@ class DragonangaWindow(Gtk.Window):
                 chosen_move = matching[0]
                 if len(matching) > 1:
                     chosen_move = self.ask_promotion(matching)
+                    if chosen_move is None:          # the promotion window was closed: nothing is played, and the
+                        self.area.queue_draw()       # piece stays selected, as before the click
+                        return
                 self.selected_sq = None
                 self.make_move(chosen_move)
                 return
@@ -3475,7 +3525,7 @@ class DragonangaWindow(Gtk.Window):
         dialog.destroy()
         if 0 <= resp < len(matching_moves):
             return matching_moves[resp]
-        return matching_moves[0]
+        return None                                  # window closed / Esc: the move is cancelled
 
     def make_move(self, uci_move):
         self.push_move(uci_move)
